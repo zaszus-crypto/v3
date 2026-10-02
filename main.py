@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD GOLD SIGNAL BOT — GitHub Actions Edition v2.1 (FIXED)
+XAUUSD GOLD SIGNAL BOT — GitHub Actions Edition v2.2 (FINAL)
 ================================================================
-Perbaikan v2.1:
-  • Spot verification: AUTO-CALIBRATION (offset dinamis via EMA)
-  • Skip hanya jika spread melompat tiba-tiba (data korup), bukan karena
-    offset default usang
-  • Weekend gap warning dihilangkan (tidak lagi spam log tiap run)
-  • Sanity check absolut untuk spread ekstrem
-
+Perbaikan v2.2:
+  • Gap detection: span-aware (deteksi gap yang melintasi Sabtu/Minggu,
+    termasuk holiday seperti Labor Day — bukan hanya weekend literal)
+  • Spot calibration: BOOTSTRAP MODE — 3 run pertama lenient (accept
+    observed spread), setelah itu gate aktif
+  • Threshold switch: gunakan prev_offset (sebelum update) untuk gate,
+    bukan new_offset (yang self-referencing dan melemahkan sinyal)
 Sinyal dikirim ke Telegram untuk eksekusi MANUAL di MT5.
 """
 import os, json, time, math, random, pickle, requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 # ========================== KONFIGURASI ==========================
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -27,8 +27,8 @@ MODEL_META_FILE  = os.path.join(STATE_DIR, "ml_meta.json")
 os.makedirs(STATE_DIR, exist_ok=True)
 
 # Sesi (UTC). Gold bergerak 24 jam; prioritaskan overlap London–NY.
-KILLZONES     = [(0, 5), (6, 12), (12, 17)]     # Asia, London, NY-overlap
-PRIME_HOURS   = set(range(12, 17))               # overlap = likuiditas tertinggi
+KILLZONES     = [(0, 5), (6, 12), (12, 17)]
+PRIME_HOURS   = set(range(12, 17))
 
 # Voting
 MIN_SCORE_WEIGHTED = 2.6
@@ -43,10 +43,11 @@ ATR_PERIOD = 14
 # Anti-spam
 COOLDOWN_MIN = 90
 
-# Spot verification (v2.1 — auto-calibration)
-SPOT_OFFSET_DEFAULT   = -15.0       # initial guess (contango 2026); akan auto-adjust
-MAX_SUDDEN_SHIFT      = 12.0        # skip jika spread lompat > $12 dari EMA
-ABSOLUTE_MAX_SPREAD   = 60.0        # sanity: contango ekstrem / data korup
+# Spot verification (v2.2 — bootstrap-aware)
+SPOT_OFFSET_DEFAULT  = 15.0        # 2026 contango realism; auto-adjust
+MAX_SUDDEN_SHIFT     = 12.0        # gate aktif SETELAH bootstrap
+ABSOLUTE_MAX_SPREAD  = 60.0
+BOOTSTRAP_SAMPLES    = 3           # jumlah run sebelum gate aktif
 
 # ========================== UTILITAS ==========================
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -84,7 +85,7 @@ def send_telegram(text):
 def load_state():
     default = {"last_signal_time": "", "last_direction": "",
                "sent_ids": [], "spot_offset": SPOT_OFFSET_DEFAULT,
-               "open_signals": []}
+               "spot_samples": 0, "open_signals": []}
     try:
         with open(STATE_FILE) as f:
             s = json.load(f)
@@ -100,6 +101,16 @@ def save_state(s):
             json.dump(s, f, indent=2)
     except Exception as e:
         log(f"save_state error: {e}")
+
+def _spans_weekend(t1: datetime, t2: datetime) -> bool:
+    """True jika interval (t1, t2) melewati Sabtu/Minggu — termasuk holiday."""
+    d = t1.date()
+    end = t2.date()
+    while d <= end:
+        if d.weekday() >= 5:      # 5=Sabtu, 6=Minggu
+            return True
+        d += timedelta(days=1)
+    return False
 
 # ========================== DATA (Yahoo, fallback ganda) ==========================
 _INTERVAL_MIN = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}
@@ -146,35 +157,30 @@ def fetch_ohlc(interval="30m", rng="5d", drop_incomplete=True):
         o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
         if None in (o, h, l, c): continue
         if h < l or o <= 0 or c <= 0 or h <= 0 or l <= 0: continue
-        if h < max(o, c) or l > min(o, c): continue          # OHLC tidak konsisten
+        if h < max(o, c) or l > min(o, c): continue
         dt = datetime.fromtimestamp(t, timezone.utc)
         if dt in seen: continue
         seen.add(dt)
         if drop_incomplete and (dt + timedelta(minutes=step_min)) > now:
-            continue                                          # candle belum close
+            continue
         v = vols[i] if i < len(vols) and vols[i] is not None else 0
         candles.append({"time": dt, "open": float(o), "high": float(h),
                         "low": float(l), "close": float(c), "vol": float(v)})
     if len(candles) < 55:
         raise ValueError(f"Data {interval} terlalu sedikit: {len(candles)}")
 
-    # Deteksi gap besar — abaikan weekend (Jumat 21:00 → Minggu 22:00 UTC)
+    # Gap warning — abaikan jika lintasi weekend/holiday
     for i in range(1, len(candles)):
         gap_min = (candles[i]["time"] - candles[i-1]["time"]).total_seconds()/60
         if gap_min <= step_min * 4:
             continue
-        t_prev = candles[i-1]["time"]
-        t_curr = candles[i]["time"]
-        # Weekend: prev Jumat (wd=4) → curr Sabtu/Minggu (wd>=5)
-        is_weekend = (t_prev.weekday() == 4 and t_curr.weekday() >= 5)
-        if is_weekend:
-            continue                              # normal, bukan error
-        log(f"WARNING gap {gap_min:.0f} menit pada {t_curr} "
-            f"(wd_prev={t_prev.weekday()}, wd_curr={t_curr.weekday()})")
+        if _spans_weekend(candles[i-1]["time"], candles[i]["time"]):
+            continue                                    # weekend/holiday — normal
+        log(f"WARNING gap {gap_min:.0f} menit pada {candles[i]['time']}")
     return candles
 
 def fetch_spot():
-    """Multi-source spot; ambil median untuk robustness."""
+    """Multi-source spot; ambil median."""
     prices = []
     try:
         p = float(requests.get("https://api.gold-api.com/price/XAU",
@@ -187,13 +193,12 @@ def fetch_spot():
         prices.append(p)
     except Exception: pass
     if not prices: return None
-    return sorted(prices)[len(prices)//2]        # median
+    return sorted(prices)[len(prices)//2]
 
 # ========================== INDIKATOR ==========================
 def ema(vals, n):
     if not vals: return 0.0
-    if len(vals) < n:
-        return sum(vals)/len(vals)
+    if len(vals) < n: return sum(vals)/len(vals)
     k = 2/(n+1); e = vals[-n]
     for v in vals[-n+1:]: e = v*k + e*(1-k)
     return e
@@ -299,8 +304,7 @@ def regime_ok(c):
     if len(c) < 20: return False
     a = atr(c, 14); px = c[-1]["close"]
     if px <= 0: return False
-    rel = a/px
-    return 0.0008 < rel < 0.02
+    return 0.0008 < a/px < 0.02
 
 def in_killzone():
     h = datetime.now(timezone.utc).hour
@@ -335,8 +339,7 @@ def calc_lot(entry, sl, risk_pct=1.0, equity=1000.0):
     risk_usd = equity * risk_pct / 100.0
     sl_dist  = abs(entry - sl)
     if sl_dist <= 0: return 0.01
-    lot = risk_usd / (sl_dist * 100.0)     # XAUUSD: 1 lot = $100 per $1 move
-    return max(0.01, round(lot, 2))
+    return max(0.01, round(risk_usd / (sl_dist * 100.0), 2))
 
 # ========================== SIGNAL BUILDER ==========================
 def build_signal(score, sl, tp, price, votes, regime_note, spot_txt, lot):
@@ -359,7 +362,7 @@ def build_signal(score, sl, tp, price, votes, regime_note, spot_txt, lot):
 
 # ========================== MAIN ==========================
 def main():
-    log("=== RUN BOT XAUUSD v2.1 ===")
+    log("=== RUN BOT XAUUSD v2.2 ===")
     state = load_state()
 
     # --- 1. Fetch data ---
@@ -386,31 +389,35 @@ def main():
     hh = datetime.now(timezone.utc).hour
     prime = hh in PRIME_HOURS
 
-    # --- 4. Spot verification + AUTO-CALIBRATION (v2.1) ---
+    # --- 4. Spot verification + BOOTSTRAP-AWARE calibration (v2.2) ---
     spot_raw = fetch_spot()
     if spot_raw is not None:
-        raw_spread = price - spot_raw                        # futures - spot
-        prev_offset = state.get("spot_offset", raw_spread)
-        # EMA α=0.15 (reaktif tapi tidak melompat)
-        new_offset = 0.85 * prev_offset + 0.15 * raw_spread
-        state["spot_offset"] = round(new_offset, 2)
+        raw_spread = price - spot_raw
+        prev_offset = float(state.get("spot_offset", raw_spread))
+        samples     = int(state.get("spot_samples", 0))
 
-        dev_from_ema = abs(raw_spread - new_offset)
-
-        if dev_from_ema > MAX_SUDDEN_SHIFT:
-            log(f"⚠️ Spot jump {dev_from_ema:.2f} USD dari EMA "
-                f"(raw_spread={raw_spread:.2f}, EMA={new_offset:.2f}). "
-                f"Kemungkinan data korup. Skip.")
-            save_state(state)
-            return
+        # Sanity: spread absolut tidak masuk akal?
         if abs(raw_spread) > ABSOLUTE_MAX_SPREAD:
             log(f"⚠️ Spread absolut {raw_spread:.2f} > {ABSOLUTE_MAX_SPREAD}. Skip.")
-            save_state(state)
-            return
+            save_state(state); return
 
-        spot_txt = (f"spread {raw_spread:+.2f} | "
-                    f"EMA {new_offset:+.2f} | "
-                    f"Δ {dev_from_ema:.2f}")
+        # Gate: hanya aktif setelah bootstrap
+        dev_from_prev = abs(raw_spread - prev_offset)
+        gate_active   = samples >= BOOTSTRAP_SAMPLES
+        if gate_active and dev_from_prev > MAX_SUDDEN_SHIFT:
+            log(f"⚠️ Spot jump {dev_from_prev:.2f} USD "
+                f"(raw={raw_spread:.2f}, prev={prev_offset:.2f}, "
+                f"samples={samples}). Kemungkinan data korup. Skip.")
+            save_state(state); return
+
+        # Update EMA
+        new_offset = 0.85 * prev_offset + 0.15 * raw_spread
+        state["spot_offset"]  = round(new_offset, 2)
+        state["spot_samples"] = samples + 1
+
+        mode = "BOOTSTRAP" if not gate_active else "ACTIVE"
+        spot_txt = (f"spread {raw_spread:+.2f} | EMA {new_offset:+.2f} | "
+                    f"Δ {dev_from_prev:.2f} | {mode} #{samples+1}")
     else:
         spot_txt = "gagal verifikasi (lanjut hati-hati)"
 
@@ -422,7 +429,6 @@ def main():
         "SqueezeBreak": strat_squeeze_breakout(c30),
     }
     score = sum(votes[k] * WEIGHTS[k] for k in votes)
-    # bonus prime-hour untuk sinyal dengan conviction kuat
     if prime and abs(score) >= MIN_SCORE_WEIGHTED:
         score *= 1.05
     log(f"Votes: {votes} => weighted score {score:.2f}")
