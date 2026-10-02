@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSMOM GOLD v15.4 (Clean & Direct)
-Menggunakan GC=F (Gold Futures) sebagai standar institusional.
-Sinyal tren (LONG/SHORT) 100% valid untuk diaplikasikan di MT5 (XAU/USD).
+TSMOM GOLD v15.5 (Hybrid Price Source)
+Historical Data: GC=F (Yahoo Finance, stabil untuk indikator)
+Live Display Price: XAU/USD Spot (api.gold-api.com, sesuai MT5)
 """
 import os
 import sys
@@ -19,8 +19,8 @@ from typing import List, Dict, Any, Optional
 # 1. KONFIGURASI
 # ==============================================================================
 class Config:
-    VERSION         = "15.4"
-    SYMBOL          = "GC=F"        # Standar institusional untuk TSMOM Gold
+    VERSION         = "15.5"
+    HISTORICAL_SYMBOL = "GC=F"      # Untuk data historis (indikator)
     
     LOOKBACK        = 252
     REBALANCE       = 5
@@ -33,30 +33,24 @@ class Config:
     SIZE_MAX        = 2.5
     MAX_HOLD        = 400
     
-    # --- ADX FILTER ---
     ADX_PERIOD      = 14
     ADX_THRESHOLD   = 22
     
-    # --- MULTI-TIMEFRAME ---
     MTF_ENABLED     = True
     MTF_TIMEFRAMES  = ["1d", "1wk"]
     MTF_LOOKBACKS   = [50, 20]
     
-    # --- CORRELATION CHECK ---
     CORRELATION_ENABLED = True
     CORREL_SYMBOLS  = ["DX-Y.NYB", "^GSPC"]
     CORREL_LOOKBACK = 20
     
-    # --- VOLATILITY REGIME ---
     VOL_REGIME_ENABLED = True
     VOL_LOW_THRESHOLD = 0.15
     VOL_HIGH_THRESHOLD = 0.25
     
-    # --- CONFIRMATION FILTERS ---
     VOLUME_SPIKE_MULT = 1.5
     SMA_PROXIMITY_PCT = 2.0
     
-    # --- PRODUKTION SAFETY ---
     FETCH_DELAY     = 1.5
     FETCH_TIMEOUT   = 30
     MAX_TELEGRAM_LEN = 4000
@@ -161,6 +155,24 @@ def _parse(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "low": float(l), "close": float(c), 
                     "volume": float(vol) if vol else 0})
     return out
+
+def get_live_spot_gold_price() -> float:
+    """
+    Mengambil harga Spot Gold (XAU/USD) real-time tanpa API key.
+    Sumber: api.gold-api.com (sangat stabil dan gratis).
+    """
+    try:
+        url = "https://api.gold-api.com/price/XAU"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            price = float(data.get("price", 0))
+            if price > 0:
+                log.info(f"✅ Harga Spot Live berhasil diambil: ${price:.2f}")
+                return price
+    except Exception as e:
+        log.warning(f"Gagal ambil harga spot live, fallback ke data historis: {e}")
+    return 0.0
 
 # ==============================================================================
 # 4. INDIKATOR
@@ -271,8 +283,8 @@ def analyze_multi_layer() -> Dict[str, Any]:
     if Config.SKIP_WEEKEND and is_weekend():
         return {"signal": "SKIP", "reason": "Weekend — pasar tutup"}
     
-    log.info(f"Fetching data untuk {Config.SYMBOL}...")
-    gold_data = fetch_data(Config.SYMBOL, "1d", Config.DATA_YEARS, required=True)
+    log.info(f"Fetching historical data untuk {Config.HISTORICAL_SYMBOL}...")
+    gold_data = fetch_data(Config.HISTORICAL_SYMBOL, "1d", Config.DATA_YEARS, required=True)
     
     freshness = check_data_freshness(gold_data)
     if not freshness["fresh"]:
@@ -281,11 +293,15 @@ def analyze_multi_layer() -> Dict[str, Any]:
         return {"signal": "NO_DATA", "reason": "Data tidak cukup"}
     
     closes = [d["close"] for d in gold_data]
-    current_price = closes[-1]
+    current_price_hist = closes[-1]
     current_adx = calculate_adx(gold_data, Config.ADX_PERIOD)
     current_sma = sma(closes, 200)
     current_vol_data = gold_data[-1]["volume"]
     avg_vol = avg_volume(gold_data, 20)
+    
+    # Ambil harga Spot Live untuk tampilan
+    live_spot_price = get_live_spot_gold_price()
+    display_price = live_spot_price if live_spot_price > 0 else current_price_hist
     
     if current_adx < Config.ADX_THRESHOLD:
         return {
@@ -293,12 +309,13 @@ def analyze_multi_layer() -> Dict[str, Any]:
             "confidence": 0,
             "reason": f"ADX {current_adx:.1f} di bawah {Config.ADX_THRESHOLD} (sideways)",
             "adx": current_adx,
-            "price": current_price,
+            "display_price": display_price,
             "sma200": current_sma,
-            "last_update": freshness["last_update"]
+            "last_update": freshness["last_update"],
+            "is_spot": live_spot_price > 0
         }
     
-    momentum_dir = 1 if current_price > closes[-Config.LOOKBACK] else -1
+    momentum_dir = 1 if current_price_hist > closes[-Config.LOOKBACK] else -1
     confidence_score = 0
     confirmations = []
     warnings = []
@@ -314,7 +331,7 @@ def analyze_multi_layer() -> Dict[str, Any]:
         confidence_score += 2
         confirmations.append(f"Volume spike ({current_vol_data/avg_vol:.1f}x)")
     
-    sma_distance_pct = abs(current_price - current_sma) / current_sma * 100
+    sma_distance_pct = abs(current_price_hist - current_sma) / current_sma * 100
     if sma_distance_pct <= Config.SMA_PROXIMITY_PCT:
         confidence_score += 1
         confirmations.append(f"Dekat SMA 200 ({sma_distance_pct:.1f}%)")
@@ -324,7 +341,7 @@ def analyze_multi_layer() -> Dict[str, Any]:
         mtf_signals = []
         for tf, lb in zip(Config.MTF_TIMEFRAMES, Config.MTF_LOOKBACKS):
             try:
-                tf_data = gold_data if tf == "1d" else fetch_data(Config.SYMBOL, tf, 2, required=False)
+                tf_data = gold_data if tf == "1d" else fetch_data(Config.HISTORICAL_SYMBOL, tf, 2, required=False)
                 if tf_data and len(tf_data) > lb:
                     tf_closes = [d["close"] for d in tf_data]
                     tf_momentum = 1 if tf_closes[-1] > tf_closes[-lb] else -1
@@ -384,20 +401,23 @@ def analyze_multi_layer() -> Dict[str, Any]:
         "confirmations": confirmations,
         "warnings": warnings,
         "adx": current_adx,
-        "price": current_price,
+        "display_price": display_price,
         "sma200": current_sma,
         "momentum": momentum_dir,
-        "last_update": freshness["last_update"]
+        "last_update": freshness["last_update"],
+        "is_spot": live_spot_price > 0
     }
 
 # ==============================================================================
 # 7. MAIN RUN
 # ==============================================================================
 def run():
-    log.info(f"=== 🚀 TSMOM GOLD v{Config.VERSION} (Clean & Direct) ===")
+    log.info(f"=== 🚀 TSMOM GOLD v{Config.VERSION} (Hybrid Price) ===")
     signal_data = analyze_multi_layer()
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%d %b %Y %H:%M UTC")
+    
+    price_label = "XAU/USD (Spot MT5)" if signal_data.get("is_spot") else "Gold (Data Historis)"
     
     if signal_data.get("signal") == "SKIP":
         msg = f"<b>⏸️ TSMOM GOLD v{Config.VERSION} — SKIP</b>\n📅 {date_str}\n──────────────────────\n<b>Alasan:</b> {signal_data['reason']}\n──────────────────────\n<i>Script akan jalan lagi besok.</i>"
@@ -408,7 +428,7 @@ def run():
         msg = (
             f"<b>🔍 TSMOM GOLD v{Config.VERSION} — NO TRADE</b>\n"
             f"📅 {date_str}\n"
-            f"💰 Gold Futures (GC=F): ${signal_data['price']:.2f}\n"
+            f"💰 {price_label}: ${signal_data['display_price']:.2f}\n"
             f"📊 Data terakhir: {last_update.strftime('%d %b %Y')}\n"
             f"──────────────────────\n"
             f"<b>Status:</b> {signal_data['reason']}\n"
@@ -424,7 +444,7 @@ def run():
         msg = (
             f"{conf_emoji[signal_data['confidence']]} <b>TSMOM GOLD v{Config.VERSION} — MULTI-LAYER</b>\n"
             f"📅 {date_str}\n"
-            f"💰 Gold Futures (GC=F): ${signal_data['price']:.2f}\n"
+            f"💰 {price_label}: ${signal_data['display_price']:.2f}\n"
             f"📊 Data: {last_update.strftime('%d %b %Y')}\n"
             f"──────────────────────\n"
             f"<b>Sinyal:</b> {signal_data['signal']}\n"
@@ -445,8 +465,7 @@ def run():
             f"──────────────────────\n"
             f"<b>⚠️ PENTING:</b>\n"
             f"• BUKAN auto-trade signal\n"
-            f"• Sinyal tren ini 100% valid untuk MT5 (XAU/USD)\n"
-            f"• Harga Spot MT5 mungkin berbeda ~0.5% (futures premium)\n"
+            f"• Harga di atas adalah Spot (sesuai MT5)\n"
             f"• STRONG: 1% | MEDIUM: 0.5% | WEAK: skip\n"
             f"• Stop loss: 2x ATR\n"
             f"──────────────────────\n"
