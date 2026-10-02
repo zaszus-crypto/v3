@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD GOLD SIGNAL BOT — GitHub Actions Edition v2.2 (FINAL)
+XAUUSD GOLD SIGNAL BOT — v3.0 REGIME-SWITCHING
 ================================================================
-Perbaikan v2.2:
-  • Gap detection: span-aware (deteksi gap yang melintasi Sabtu/Minggu,
-    termasuk holiday seperti Labor Day — bukan hanya weekend literal)
-  • Spot calibration: BOOTSTRAP MODE — 3 run pertama lenient (accept
-    observed spread), setelah itu gate aktif
-  • Threshold switch: gunakan prev_offset (sebelum update) untuk gate,
-    bukan new_offset (yang self-referencing dan melemahkan sinyal)
-Sinyal dikirim ke Telegram untuk eksekusi MANUAL di MT5.
+Berdasarkan diagnostic backtest 60 hari:
+  • SMC_Sweep: PF 0.43 (RUSAK) → DIBUANG
+  • SqueezeBreak: PF 0.64, n=2 → DIBUANG (sampel kecil)
+  • MSB_MultiTF: PF 1.30, n=990 → DIPAKAI saat TRENDING
+  • MeanReversion: PF 2.65, n=42 → DIPAKAI saat RANGING
+
+Regime detection via ADX:
+  ADX > 25 → TRENDING  → MSB_MultiTF
+  ADX < 20 → RANGING   → MeanReversion
+  20-25    → TRANSISI  → skip (tidak trade)
 """
 import os, json, time, math, random, pickle, requests
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 
 # ========================== KONFIGURASI ==========================
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -26,14 +28,13 @@ MODEL_META_FILE  = os.path.join(STATE_DIR, "ml_meta.json")
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
-# Sesi (UTC). Gold bergerak 24 jam; prioritaskan overlap London–NY.
-KILLZONES     = [(0, 5), (6, 12), (12, 17)]
-PRIME_HOURS   = set(range(12, 17))
+# Sesi (UTC)
+KILLZONES   = [(0, 5), (6, 12), (12, 17)]
+PRIME_HOURS = set(range(12, 17))
 
-# Voting
-MIN_SCORE_WEIGHTED = 1.8
-WEIGHTS = {"SMC_Sweep": 1.25, "MSB_MultiTF": 1.15,
-           "MeanReversion": 0.80, "SqueezeBreak": 1.00}
+# Regime thresholds
+ADX_TREND   = 25     # >= ini -> trending (pakai MSB)
+ADX_RANGE   = 20     # <= ini -> ranging (pakai MR)
 
 # Risk model
 SL_MULT    = 1.8
@@ -43,11 +44,11 @@ ATR_PERIOD = 14
 # Anti-spam
 COOLDOWN_MIN = 90
 
-# Spot verification (v2.2 — bootstrap-aware)
-SPOT_OFFSET_DEFAULT  = 15.0        # 2026 contango realism; auto-adjust
-MAX_SUDDEN_SHIFT     = 12.0        # gate aktif SETELAH bootstrap
-ABSOLUTE_MAX_SPREAD  = 60.0
-BOOTSTRAP_SAMPLES    = 3           # jumlah run sebelum gate aktif
+# Spot verification
+SPOT_OFFSET_DEFAULT = 15.0
+MAX_SUDDEN_SHIFT    = 12.0
+ABSOLUTE_MAX_SPREAD = 60.0
+BOOTSTRAP_SAMPLES   = 3
 
 # ========================== UTILITAS ==========================
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -79,7 +80,7 @@ def send_telegram(text):
         except Exception as e:
             log(f"Telegram error attempt {attempt+1}: {e}")
         time.sleep(3 * (attempt + 1) + random.uniform(0, 2))
-    log("GAGAL kirim Telegram setelah semua percobaan.")
+    log("GAGAL kirim Telegram.")
     return False
 
 def load_state():
@@ -102,17 +103,14 @@ def save_state(s):
     except Exception as e:
         log(f"save_state error: {e}")
 
-def _spans_weekend(t1: datetime, t2: datetime) -> bool:
-    """True jika interval (t1, t2) melewati Sabtu/Minggu — termasuk holiday."""
+def _spans_weekend(t1, t2):
     d = t1.date()
-    end = t2.date()
-    while d <= end:
-        if d.weekday() >= 5:      # 5=Sabtu, 6=Minggu
-            return True
+    while d <= t2.date():
+        if d.weekday() >= 5: return True
         d += timedelta(days=1)
     return False
 
-# ========================== DATA (Yahoo, fallback ganda) ==========================
+# ========================== DATA ==========================
 _INTERVAL_MIN = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}
 
 def _yahoo_chart(symbol, interval, rng, host="query1"):
@@ -134,7 +132,6 @@ def _yahoo_chart(symbol, interval, rng, host="query1"):
     raise RuntimeError(f"Yahoo fetch gagal: {last_err}")
 
 def fetch_ohlc(interval="30m", rng="5d", drop_incomplete=True):
-    """OHLC dari Yahoo Finance (GC=F) dengan validasi ketat."""
     data = None
     for host in ("query1", "query2"):
         try:
@@ -169,18 +166,14 @@ def fetch_ohlc(interval="30m", rng="5d", drop_incomplete=True):
     if len(candles) < 55:
         raise ValueError(f"Data {interval} terlalu sedikit: {len(candles)}")
 
-    # Gap warning — abaikan jika lintasi weekend/holiday
     for i in range(1, len(candles)):
         gap_min = (candles[i]["time"] - candles[i-1]["time"]).total_seconds()/60
-        if gap_min <= step_min * 4:
-            continue
-        if _spans_weekend(candles[i-1]["time"], candles[i]["time"]):
-            continue                                    # weekend/holiday — normal
+        if gap_min <= step_min * 4: continue
+        if _spans_weekend(candles[i-1]["time"], candles[i]["time"]): continue
         log(f"WARNING gap {gap_min:.0f} menit pada {candles[i]['time']}")
     return candles
 
 def fetch_spot():
-    """Multi-source spot; ambil median."""
     prices = []
     try:
         p = float(requests.get("https://api.gold-api.com/price/XAU",
@@ -228,13 +221,36 @@ def rsi(closes, n=14):
     rs = (g/n) / (l/n)
     return 100 - 100/(1+rs)
 
-def bollinger(closes, n=20, mult=2.0):
-    if len(closes) < n:
-        m = sma(closes, len(closes)); return m, m, m, 0.0
-    m = sma(closes, n)
-    var = sum((c-m)**2 for c in closes[-n:]) / n
-    sd = math.sqrt(var)
-    return m, m + mult*sd, m - mult*sd, sd
+def adx(candles, n=14):
+    """Average Directional Index (Wilder smoothing)."""
+    if len(candles) < 2*n + 2: return 20.0
+    trs, pdm, mdm = [], [], []
+    for i in range(1, len(candles)):
+        up = candles[i]["high"] - candles[i-1]["high"]
+        dn = candles[i-1]["low"] - candles[i]["low"]
+        pdm.append(up if (up > dn and up > 0) else 0.0)
+        mdm.append(dn if (dn > up and dn > 0) else 0.0)
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    def wilder(vals, p):
+        if len(vals) < p: return []
+        s = sum(vals[:p]); out = [s]
+        for v in vals[p:]:
+            s = s - s/p + v
+            out.append(s)
+        return out
+    atr_w = wilder(trs, n)
+    pdm_w = wilder(pdm, n)
+    mdm_w = wilder(mdm, n)
+    if not atr_w: return 20.0
+    pdi = [100 * a/(b+1e-9) for a, b in zip(pdm_w, atr_w)]
+    mdi = [100 * a/(b+1e-9) for a, b in zip(mdm_w, atr_w)]
+    dx = [100 * abs(a-b)/(a+b+1e-9) for a, b in zip(pdi, mdi)]
+    if len(dx) < n: return sum(dx)/len(dx) if dx else 20.0
+    s = sum(dx[:n])
+    for v in dx[n:]:
+        s = s - s/n + v
+    return s/n
 
 def swing_points(candles, lb=5):
     highs, lows = [], []
@@ -248,16 +264,9 @@ def swing_points(candles, lb=5):
             lows.append(l)
     return highs[-3:], lows[-3:]
 
-# ========================== STRATEGI ==========================
-def strat_smc_sweep(c):
-    highs, lows = swing_points(c)
-    if not highs or not lows or len(c) < 3: return 0
-    last = c[-1]
-    if last["low"] < min(lows) and last["close"] > min(lows): return +1
-    if last["high"] > max(highs) and last["close"] < max(highs): return -1
-    return 0
-
+# ========================== STRATEGI (hanya yang punya edge) ==========================
 def strat_msb_mtf(c30, c60):
+    """Trend following — proven PF 1.30, n=990."""
     if len(c60) < 55 or len(c30) < 25: return 0
     e60 = ema([x["close"] for x in c60], 50)
     bias = +1 if c60[-1]["close"] > e60 else -1
@@ -266,6 +275,7 @@ def strat_msb_mtf(c30, c60):
     return bias if bias == trig else 0
 
 def strat_mean_reversion(c, c60=None):
+    """Counter-trend — proven PF 2.65, n=42."""
     closes = [x["close"] for x in c]
     if len(closes) < 50: return 0
     m = sma(closes, 50)
@@ -280,24 +290,6 @@ def strat_mean_reversion(c, c60=None):
         trend_down = c60[-1]["close"] < e200
     if z <= -2.0 and r < 35 and not trend_down: return +1
     if z >= 2.0 and r > 65 and not trend_up: return -1
-    return 0
-
-def strat_squeeze_breakout(c):
-    closes = [x["close"] for x in c]
-    if len(closes) < 25: return 0
-    m, up, lo, sd = bollinger(closes)
-    if m <= 0: return 0
-    a_now = atr(c, 14)
-    a_ref = atr(c[:-7], 14) if len(c) > 21 else a_now
-    width = (up-lo)/m
-    squeeze = width < 0.008
-    expansion = a_now > a_ref * 1.3
-    vols = [x.get("vol", 0) for x in c]
-    v_avg = sma(vols[-20:], 20) if len(vols) >= 20 else 1
-    v_spike = vols[-1] > v_avg * 1.4 if v_avg > 0 else False
-    last = c[-1]
-    if squeeze and expansion and v_spike and last["close"] > up: return +1
-    if squeeze and expansion and v_spike and last["close"] < lo: return -1
     return 0
 
 def regime_ok(c):
@@ -342,19 +334,20 @@ def calc_lot(entry, sl, risk_pct=1.0, equity=1000.0):
     return max(0.01, round(risk_usd / (sl_dist * 100.0), 2))
 
 # ========================== SIGNAL BUILDER ==========================
-def build_signal(score, sl, tp, price, votes, regime_note, spot_txt, lot):
+def build_signal(score, sl, tp, price, strategy_name, regime, ml_txt,
+                 spot_txt, lot):
     emoji = "🟢 BUY" if score > 0 else "🔴 SELL"
     side  = "BUY" if score > 0 else "SELL"
     return (
-        f"<b>{emoji} XAUUSD — {side} (M30/H1)</b>\n"
+        f"<b>{emoji} XAUUSD — {side} ({strategy_name})</b>\n"
         f"──────────────────\n"
         f"💰 Entry ref   : <b>{price:,.2f}</b>\n"
         f"🎯 Toleransi   : ±2.00 USD (skip jika di luar)\n"
         f"🛑 Stop Loss   : <b>{sl:,.2f}</b>\n"
         f"🎯 Take Profit : <b>{tp:,.2f}</b>  (RR 1:{RR_TARGET})\n"
         f"📦 Saran Lot   : <b>{lot}</b> (risk 1% / equity $1000)\n"
-        f"🧠 Skor        : {abs(score):.2f} | {votes}\n"
-        f"📊 Regime      : {regime_note}\n"
+        f"📊 Regime      : {regime}\n"
+        f"🧠 ML proba    : {ml_txt}\n"
         f"🔎 Spot        : {spot_txt}\n"
         f"⏰ {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC\n"
         f"⚠️ Eksekusi MANUAL di MT5."
@@ -362,10 +355,10 @@ def build_signal(score, sl, tp, price, votes, regime_note, spot_txt, lot):
 
 # ========================== MAIN ==========================
 def main():
-    log("=== RUN BOT XAUUSD v2.2 ===")
+    log("=== RUN BOT XAUUSD v3.0 (REGIME-SWITCHING) ===")
     state = load_state()
 
-    # --- 1. Fetch data ---
+    # 1. Fetch data
     try:
         c30 = fetch_ohlc("30m", "5d")
         c60 = fetch_ohlc("1h", "1mo")
@@ -379,75 +372,69 @@ def main():
     if a <= 0:
         log("ATR = 0, skip."); return
 
-    # --- 2. Regime gate ---
+    # 2. Regime gate (volatilitas)
     if not regime_ok(c30):
         log("Regime volatilitas ekstrem/sepi. Skip."); return
 
-    # --- 3. Session gate ---
+    # 3. Session gate
     if not in_killzone():
         log("Di luar killzone. Skip."); return
     hh = datetime.now(timezone.utc).hour
     prime = hh in PRIME_HOURS
 
-    # --- 4. Spot verification + BOOTSTRAP-AWARE calibration (v2.2) ---
+    # 4. ADX REGIME DETECTION
+    adx_val = adx(c30, 14)
+    if adx_val >= ADX_TREND:
+        regime = "TRENDING"
+        strategy = "MSB_MultiTF"
+        votes = {"MSB_MultiTF": strat_msb_mtf(c30, c60)}
+        score = votes["MSB_MultiTF"] * 1.5
+    elif adx_val <= ADX_RANGE:
+        regime = "RANGING"
+        strategy = "MeanReversion"
+        votes = {"MeanReversion": strat_mean_reversion(c30, c60)}
+        score = votes["MeanReversion"] * 2.0
+    else:
+        log(f"ADX {adx_val:.1f} di zona transisi (20-25). Skip.")
+        return
+    log(f"ADX={adx_val:.1f} | Regime={regime} | Strategy={strategy} | score={score:.2f}")
+
+    # 5. Spot verification
     spot_raw = fetch_spot()
     if spot_raw is not None:
         raw_spread = price - spot_raw
         prev_offset = float(state.get("spot_offset", raw_spread))
         samples     = int(state.get("spot_samples", 0))
-
-        # Sanity: spread absolut tidak masuk akal?
         if abs(raw_spread) > ABSOLUTE_MAX_SPREAD:
             log(f"⚠️ Spread absolut {raw_spread:.2f} > {ABSOLUTE_MAX_SPREAD}. Skip.")
             save_state(state); return
-
-        # Gate: hanya aktif setelah bootstrap
         dev_from_prev = abs(raw_spread - prev_offset)
-        gate_active   = samples >= BOOTSTRAP_SAMPLES
+        gate_active = samples >= BOOTSTRAP_SAMPLES
         if gate_active and dev_from_prev > MAX_SUDDEN_SHIFT:
-            log(f"⚠️ Spot jump {dev_from_prev:.2f} USD "
-                f"(raw={raw_spread:.2f}, prev={prev_offset:.2f}, "
-                f"samples={samples}). Kemungkinan data korup. Skip.")
+            log(f"⚠️ Spot jump {dev_from_prev:.2f} > {MAX_SUDDEN_SHIFT}. Skip.")
             save_state(state); return
-
-        # Update EMA
         new_offset = 0.85 * prev_offset + 0.15 * raw_spread
         state["spot_offset"]  = round(new_offset, 2)
         state["spot_samples"] = samples + 1
-
         mode = "BOOTSTRAP" if not gate_active else "ACTIVE"
-        spot_txt = (f"spread {raw_spread:+.2f} | EMA {new_offset:+.2f} | "
-                    f"Δ {dev_from_prev:.2f} | {mode} #{samples+1}")
+        spot_txt = f"spread {raw_spread:+.2f} | EMA {new_offset:+.2f} | {mode}"
     else:
-        spot_txt = "gagal verifikasi (lanjut hati-hati)"
+        spot_txt = "gagal verifikasi"
 
-    # --- 5. Ensemble voting (weighted) ---
-    votes = {
-        "SMC_Sweep":    strat_smc_sweep(c30),
-        "MSB_MultiTF":  strat_msb_mtf(c30, c60),
-        "MeanReversion":strat_mean_reversion(c30, c60),
-        "SqueezeBreak": strat_squeeze_breakout(c30),
-    }
-    score = sum(votes[k] * WEIGHTS[k] for k in votes)
-    if prime and abs(score) >= MIN_SCORE_WEIGHTED:
-        score *= 1.05
-    log(f"Votes: {votes} => weighted score {score:.2f}")
-
-    # --- 6. Cooldown ---
+    # 6. Cooldown
     now = datetime.now(timezone.utc)
     last_t = state.get("last_signal_time")
-    if last_t:
+    if last_t and abs(score) > 0:
         try:
             mins = (now - datetime.fromisoformat(last_t)).total_seconds()/60
         except Exception:
             mins = 999
-        same_dir = ((score > 0 and state.get("last_direction") == "BUY") or
-                    (score < 0 and state.get("last_direction") == "SELL"))
-        if same_dir and mins < COOLDOWN_MIN:
+        dir_now = "BUY" if score > 0 else "SELL"
+        if state.get("last_direction") == dir_now and mins < COOLDOWN_MIN:
             log(f"Cooldown aktif ({mins:.0f}/{COOLDOWN_MIN}m). Skip.")
             save_state(state); return
 
-    # --- 7. ML gate ---
+    # 7. ML gate
     proba = ml_proba(c30)
     ml_txt = "n/a"
     if proba is not None:
@@ -456,26 +443,28 @@ def main():
             log(f"ML menolak (proba {proba:.2f}). Skip.")
             save_state(state); return
 
-    # --- 8. Emit sinyal ---
-    if abs(score) >= MIN_SCORE_WEIGHTED:
+    # 8. Emit signal — hanya jika strategi vote != 0
+    if abs(score) > 0:
         direction = 1 if score > 0 else -1
         sl = price - direction * SL_MULT * a
         tp = price + direction * SL_MULT * a * RR_TARGET
         lot = calc_lot(price, sl)
-        msg = build_signal(score, sl, tp, price, votes,
-                           f"Volatilitas normal{' | PRIME' if prime else ''} | ML: {ml_txt}",
-                           spot_txt, lot)
+        prime_note = " | PRIME" if prime else ""
+        msg = build_signal(score, sl, tp, price, strategy,
+                           f"{regime} (ADX {adx_val:.1f}){prime_note}",
+                           ml_txt, spot_txt, lot)
         if send_telegram(msg):
             state["last_signal_time"] = now.isoformat()
             state["last_direction"]   = "BUY" if direction == 1 else "SELL"
             state.setdefault("open_signals", []).append({
                 "time": now.isoformat(), "dir": state["last_direction"],
-                "entry": price, "sl": sl, "tp": tp, "status": "PENDING"
+                "strategy": strategy, "entry": price, "sl": sl, "tp": tp,
+                "status": "PENDING"
             })
             state["open_signals"] = state["open_signals"][-50:]
             save_state(state)
     else:
-        log("Skor belum cukup. Tidak ada sinyal.")
+        log(f"Strategi {strategy} tidak vote (score=0). Tidak ada sinyal.")
     save_state(state)
 
 if __name__ == "__main__":
