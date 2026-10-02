@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSMOM GOLD v13.0 (Ultimate) — Time-Series Momentum Institutional Grade.
+TSMOM GOLD v13.0 ALL-IN-ONE
+Time-Series Momentum Institutional Grade — Single File Edition.
 Basis: Moskowitz-Ooi-Pedersen (2012) + Volatility Targeting + Realistic Frictions.
+
+CARA PAKAI:
+  1. Install requests:  pip install requests
+  2. (Opsional) Set env var untuk Telegram:
+       export TELEGRAM_TOKEN="token_anda"
+       export TELEGRAM_CHAT_ID="chat_id_anda"
+  3. Jalankan:  python tsmom_gold.py
 """
 import os
 import sys
@@ -12,424 +20,312 @@ import random
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Any
 
 # ==============================================================================
-# 1. KONFIGURASI STRATEGI & SISTEM
+# 1. KONFIGURASI (UBAH DI SINI)
 # ==============================================================================
 class Config:
-    # --- Parameter Strategi ---
-    LOOKBACK = 252          # Periode momentum (1 tahun perdagangan)
-    REBALANCE = 5           # Cek sinyal setiap 5 hari (mingguan)
-    ATR_P = 20              # Periode Average True Range
-    INIT_RISK_MULT = 2.0    # Stop loss awal = 2.0 x ATR
-    TRAIL_MULT = 4.0        # Jarak trailing stop = 4.0 x ATR
-    TARGET_VOL = 0.15       # Target volatilitas tahunan portofolio (15%)
-    VOL_WINDOW = 20         # Jendela pengamatan volatilitas (20 hari)
-    SIZE_MIN = 0.3          # Batas bawah leverage/ukuran posisi
-    SIZE_MAX = 3.0          # Batas atas leverage/ukuran posisi
-    MAX_HOLD = 500          # Maksimal hari menahan posisi (~2 tahun)
+    # --- Strategi ---
+    SYMBOL          = "GC=F"
+    LOOKBACK        = 252       # Periode momentum (hari)
+    REBALANCE       = 5         # Cek sinyal tiap 5 hari
+    ATR_P           = 20        # Periode ATR
+    INIT_RISK_MULT  = 2.0       # SL awal = 2x ATR
+    TRAIL_MULT      = 4.0       # Trailing stop = 4x ATR
+    TARGET_VOL      = 0.15      # Target volatilitas tahunan (15%)
+    VOL_WINDOW      = 20        # Jendela volatilitas
+    SIZE_MIN        = 0.3       # Leverage min
+    SIZE_MAX        = 3.0       # Leverage max
+    MAX_HOLD        = 500       # Max hari hold
+    COST_PER_TRADE_R = 0.15     # Biaya per trade (R-multiple)
     
-    # --- Realitas Pasar (Frictions) ---
-    # Biaya komisi + slippage dinyatakan dalam satuan R-multiple per trade.
-    # Contoh: 0.15R artinya setiap trade memakan biaya setara 15% dari risiko awal.
-    COST_PER_TRADE_R = 0.15 
+    # --- Data ---
+    DATA_YEARS      = 10
+    MIN_BARS        = 400
+    
+    # --- Validasi "Layak Live" ---
+    MIN_TRADES      = 20
+    MIN_PF          = 1.3
+    MIN_EXP         = 0.2
+    MIN_CONSISTENT  = 3
+    SEG_MIN_PF      = 1.1
+    NUM_SEGMENTS    = 4
+    
+    # --- Telegram (isi langsung atau via env var) ---
+    TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # --- Sistem & Notifikasi ---
-    SYMBOL = "GC=F"
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "dummy")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "dummy")
-    LOG_LEVEL = logging.INFO
-
-# Setup Logging
+# ==============================================================================
+# 2. LOGGING
+# ==============================================================================
 logging.basicConfig(
-    level=Config.LOG_LEVEL,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("TSMOM_GOLD")
+log = logging.getLogger("TSMOM")
 
 # ==============================================================================
-# 2. FUNGSI UTILITAS & INDIKATOR
+# 3. TELEGRAM
 # ==============================================================================
-def get_realized_volatility(closes: List[float], w: int = 20) -> float:
-    """Menghitung volatilitas tahunan menggunakan Log Return (lebih akurat)."""
-    if len(closes) < w + 1:
-        return 0.20  # Fallback default
-    
-    # Log return: ln(P_t / P_t-1)
-    rets = [math.log(closes[i] / closes[i-1]) for i in range(len(closes)-w, len(closes))]
-    mean_ret = sum(rets) / w
-    variance = sum((x - mean_ret) ** 2 for x in rets) / w
-    daily_vol = math.sqrt(variance)
-    
-    # Annualisasi (252 hari perdagangan)
-    return daily_vol * math.sqrt(252)
-
-def calculate_atr(data: List[Dict[str, Any]], n: int = 20) -> float:
-    """Menghitung Average True Range."""
-    if len(data) < 2:
-        return 0.0
-    
-    true_ranges = []
-    for i in range(1, len(data)):
-        h = data[i]["high"]
-        l = data[i]["low"]
-        pc = data[i-1]["close"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        true_ranges.append(tr)
-        
-    if len(true_ranges) < n:
-        return sum(true_ranges) / len(true_ranges)
-    return sum(true_ranges[-n:]) / n
-
-def calculate_stats(results: List[Dict[str, Any]], closes: List[float]) -> Dict[str, Any]:
-    """Menghitung metrik kinerja portofolio secara komprehensif."""
-    n = len(results)
-    if n == 0:
-        return {"n": 0, "wr": 0.0, "pf": 0.0, "exp": 0.0, "mdd": 0.0, "tot": 0.0, "sharpe": 0.0, "calmar": 0.0}
-
-    wins = [r for r in results if r["R_net"] > 0]
-    losses = [r for r in results if r["R_net"] <= 0]
-    
-    gross_win = sum(r["R_net"] for r in wins)
-    gross_loss = abs(sum(r["R_net"] for r in losses))
-    
-    pf = gross_win / gross_loss if gross_loss > 0 else float('inf')
-    total_r = sum(r["R_net"] for r in results)
-    expectancy = total_r / n
-    
-    # Drawdown Calculation based on Cumulative R
-    eq = 0.0
-    peak = 0.0
-    mdd = 0.0
-    daily_eq = []
-    
-    # Buat kurva ekuitas harian (simplifikasi: R terakumulasi per trade, di-interpolasi flat antar trade)
-    # Untuk akurasi lebih tinggi, kita hitung MDD berdasarkan titik ekuitas setelah setiap trade.
-    for r in results:
-        eq += r["R_net"]
-        daily_eq.append(eq)
-        if eq > peak:
-            peak = eq
-        dd = peak - eq
-        if dd > mdd:
-            mdd = dd
-
-    # Annualized Sharpe Ratio (asumsi risk-free rate = 0, berdasarkan return harian ekuivalen R)
-    # Ini adalah aproksimasi. Untuk akurasi penuh, butuh ekuitas harian sebenarnya.
-    avg_r_per_day = total_r / (results[-1]["idx"] - results[0]["idx"]) if len(results) > 1 else 0
-    sharpe = (avg_r_per_day * 252) / (0.15 * math.sqrt(252)) if 0.15 > 0 else 0 # Dinormalisasi terhadap target vol
-    
-    calmar = (total_r / mdd) if mdd > 0 else float('inf')
-
-    return {
-        "n": n,
-        "wr": (len(wins) / n) * 100,
-        "pf": pf,
-        "exp": expectancy,
-        "mdd": mdd,
-        "tot": total_r,
-        "sharpe": sharpe,
-        "calmar": calmar
-    }
+def send_telegram(text: str):
+    """Kirim ke Telegram jika token tersedia."""
+    token = Config.TELEGRAM_TOKEN
+    chat_id = Config.TELEGRAM_CHAT_ID
+    if not token or not chat_id:
+        log.info("Telegram tidak dikonfigurasi. Pesan hanya di log.")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        r = requests.post(url, json={
+            "chat_id": chat_id, "text": text, "parse_mode": "HTML"
+        }, timeout=10)
+        if r.status_code == 200:
+            log.info("✅ Telegram terkirim.")
+        else:
+            log.error(f"Telegram gagal: {r.text}")
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
 
 # ==============================================================================
-# 3. PENGAMBILAN DATA (DATA FEED)
+# 4. DATA FETCHER
 # ==============================================================================
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 def fetch_daily(years: int = 10) -> List[Dict[str, Any]]:
-    """Mengambil data historis dari Yahoo Finance dengan retry mechanism."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-    }
-    
     for host in ("query1", "query2"):
         url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{Config.SYMBOL}?interval=1d&range={years}y"
         for attempt in range(3):
             try:
-                logger.debug(f"Fetching data from {host} (Attempt {attempt+1})...")
-                r = requests.get(url, headers=headers, timeout=30)
+                r = requests.get(url, headers=HEADERS, timeout=30)
                 if r.status_code == 429:
-                    sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(f"Rate limited. Sleeping for {sleep_time:.2f}s...")
-                    time.sleep(sleep_time)
+                    time.sleep((2 ** attempt) + random.uniform(0, 1))
                     continue
                 r.raise_for_status()
-                return _parse_yahoo_data(r.json())
+                return _parse(r.json())
             except Exception as e:
-                logger.warning(f"Fetch failed: {e}. Retrying...")
+                log.warning(f"Fetch gagal ({e}), retry...")
                 time.sleep((2 ** attempt) + random.uniform(0, 1))
-                
-    raise RuntimeError("Gagal mengambil data dari Yahoo Finance setelah beberapa percobaan.")
+    raise RuntimeError("Gagal ambil data Yahoo Finance.")
 
-def _parse_yahoo_data(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Membersihkan dan memvalidasi data mentah dari Yahoo Finance."""
-    try:
-        result = data["chart"]["result"][0]
-    except (KeyError, IndexError):
-        raise ValueError("Format data Yahoo Finance tidak valid atau simbol tidak ditemukan.")
-
+def _parse(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    result = data["chart"]["result"][0]
     ts = result.get("timestamp") or []
-    quote = result["indicators"]["quote"][0]
+    q = result["indicators"]["quote"][0]
     now = datetime.now(timezone.utc)
     out = []
-
     for i, t in enumerate(ts):
         try:
-            o = quote["open"][i]
-            h = quote["high"][i]
-            l = quote["low"][i]
-            c = quote["close"][i]
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
         except (KeyError, IndexError, TypeError):
             continue
-
-        # Validasi data anomali
         if None in (o, h, l, c) or h < l or o <= 0 or c <= 0:
             continue
-
         dt = datetime.fromtimestamp(t, timezone.utc)
-        # Abaikan data masa depan (timezone mismatch protection)
         if (dt + timedelta(days=1)) > now:
             continue
-
-        out.append({
-            "time": dt,
-            "open": float(o),
-            "high": float(h),
-            "low": float(l),
-            "close": float(c)
-        })
+        out.append({"time": dt, "open": float(o), "high": float(h),
+                    "low": float(l), "close": float(c)})
     return out
 
 # ==============================================================================
-# 4. MESIN BACKTEST (CORE ENGINE)
+# 5. INDIKATOR & STATISTIK
 # ==============================================================================
-def run_backtest():
-    logger.info("=== 🚀 TSMOM GOLD v13.0 (Ultimate) ===")
+def realized_vol(closes: List[float], w: int = 20) -> float:
+    if len(closes) < w + 1:
+        return 0.20
+    rets = [math.log(closes[i] / closes[i-1]) for i in range(len(closes)-w, len(closes))]
+    m = sum(rets) / w
+    var = sum((x - m) ** 2 for x in rets) / w
+    return math.sqrt(var) * math.sqrt(252)
+
+def atr(data: List[Dict[str, Any]], n: int = 20) -> float:
+    if len(data) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(data)):
+        h, l, pc = data[i]["high"], data[i]["low"], data[i-1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-n:]) / min(n, len(trs))
+
+def calc_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    n = len(results)
+    empty = {"n": 0, "wr": 0.0, "pf": 0.0, "exp": 0.0, "mdd": 0.0, "tot": 0.0}
+    if n == 0:
+        return empty
     
-    # 1. Ambil Data
-    c = fetch_daily(years=10)
-    logger.info(f"Data berhasil dimuat: {len(c)} baris ({len(c)/252:.1f} tahun)")
+    wins = [r for r in results if r["R_net"] > 0]
+    losses = [r for r in results if r["R_net"] <= 0]
+    gw = sum(r["R_net"] for r in wins)
+    gl = abs(sum(r["R_net"] for r in losses))
+    pf = gw / gl if gl > 0 else float('inf')
+    tot = sum(r["R_net"] for r in results)
     
-    if len(c) < 400:
-        logger.error("Data tidak cukup untuk backtest (minimal 400 hari).")
-        send_telegram("⚠️ <b>TSMOM v13.0</b>: Data historis tidak cukup untuk backtest.")
+    eq = peak = mdd = 0.0
+    for r in results:
+        eq += r["R_net"]
+        peak = max(peak, eq)
+        mdd = max(mdd, peak - eq)
+    
+    return {"n": n, "wr": len(wins)/n*100, "pf": pf,
+            "exp": tot/n, "mdd": mdd, "tot": tot}
+
+# ==============================================================================
+# 6. BACKTEST ENGINE
+# ==============================================================================
+def run():
+    log.info(f"=== 🚀 TSMOM GOLD v13.0 ALL-IN-ONE ===")
+    c = fetch_daily(Config.DATA_YEARS)
+    log.info(f"Data: {len(c)} bar ({len(c)/252:.1f} tahun)")
+    
+    if len(c) < Config.MIN_BARS:
+        send_telegram("⚠️ Data tidak cukup untuk backtest.")
         return
 
     closes = [x["close"] for x in c]
     results = []
-    
-    # State variables
-    pos = 0
-    entry_price = 0.0
-    entry_idx = 0
-    peak_price = 0.0
-    init_risk = 0.0
-    trail_dist = 0.0
-    vol_size = 1.0
+    pos = 0; entry_price = 0.0; entry_idx = 0
+    peak_price = 0.0; init_risk = 0.0; trail_dist = 0.0; vol_size = 1.0
     last_rebal = -Config.REBALANCE
 
-    # 2. Loop Simulasi
     for i in range(Config.LOOKBACK + 30, len(c)):
-        current_atr = calculate_atr(c[:i+1], Config.ATR_P)
-        if current_atr <= 0:
+        a = atr(c[:i+1], Config.ATR_P)
+        if a <= 0:
             continue
 
-        # --- A. LOGIKA EXIT (Dicek setiap hari) ---
+        # --- EXIT ---
         if pos != 0:
-            hold_days = i - entry_idx
+            hold = i - entry_idx
             exited = False
             exit_price = 0.0
-
-            if pos == 1:  # Long Position
+            
+            if pos == 1:
                 peak_price = max(peak_price, c[i]["high"])
-                sl_now = max(entry_price - init_risk, peak_price - trail_dist)
-                
-                # Gap risk handling: jika low <= sl, kita asumsikan fill di sl_now ATAU open (mana yang lebih buruk)
-                if c[i]["low"] <= sl_now:
-                    exit_price = min(c[i]["open"], sl_now)
+                sl = max(entry_price - init_risk, peak_price - trail_dist)
+                if c[i]["low"] <= sl:
+                    exit_price = min(c[i]["open"], sl)
                     exited = True
-            else:  # Short Position
+            else:
                 peak_price = min(peak_price, c[i]["low"])
-                sl_now = min(entry_price + init_risk, peak_price + trail_dist)
-                
-                if c[i]["high"] >= sl_now:
-                    exit_price = max(c[i]["open"], sl_now)
+                sl = min(entry_price + init_risk, peak_price + trail_dist)
+                if c[i]["high"] >= sl:
+                    exit_price = max(c[i]["open"], sl)
                     exited = True
 
-            # Time-based exit (Max Hold)
-            if not exited and hold_days >= Config.MAX_HOLD:
+            if not exited and hold >= Config.MAX_HOLD:
                 exit_price = c[i]["close"]
                 exited = True
 
             if exited:
-                # Hitung R-Multiple
-                raw_profit_points = (exit_price - entry_price) * pos
-                r_multiple = (raw_profit_points / init_risk) * vol_size
-                r_net = r_multiple - Config.COST_PER_TRADE_R
-                
+                raw = (exit_price - entry_price) * pos
+                r_gross = (raw / init_risk) * vol_size
                 results.append({
-                    "time": str(c[i]["time"].date()),
-                    "dir": pos,
-                    "R_gross": r_multiple,
-                    "R_net": r_net,
-                    "idx": entry_idx,
-                    "hold": hold_days
+                    "time": str(c[i]["time"].date()), "dir": pos,
+                    "R_gross": r_gross, "R_net": r_gross - Config.COST_PER_TRADE_R,
+                    "idx": entry_idx, "hold": hold
                 })
-                pos = 0  # Reset posisi
+                pos = 0
 
-        # --- B. LOGIKA ENTRY & REBALANCE (Dicek mingguan) ---
+        # --- ENTRY (mingguan) ---
         if (i - last_rebal) < Config.REBALANCE:
             continue
         last_rebal = i
 
-        past_price = closes[i - Config.LOOKBACK]
-        curr_price = closes[i]
-        new_dir = 1 if curr_price > past_price else -1
-
+        new_dir = 1 if closes[i] > closes[i - Config.LOOKBACK] else -1
         if new_dir == pos:
-            continue  # Tidak ada perubahan sinyal
+            continue
 
-        # Close posisi lama jika ada (Signal Reversal)
         if pos != 0:
-            raw_profit_points = (curr_price - entry_price) * pos
-            r_multiple = (raw_profit_points / init_risk) * vol_size
-            r_net = r_multiple - Config.COST_PER_TRADE_R
-            
+            raw = (closes[i] - entry_price) * pos
+            r_gross = (raw / init_risk) * vol_size
             results.append({
-                "time": str(c[i]["time"].date()),
-                "dir": pos,
-                "R_gross": r_multiple,
-                "R_net": r_net,
-                "idx": entry_idx,
-                "hold": i - entry_idx
+                "time": str(c[i]["time"].date()), "dir": pos,
+                "R_gross": r_gross, "R_net": r_gross - Config.COST_PER_TRADE_R,
+                "idx": entry_idx, "hold": i - entry_idx
             })
 
-        # Buka posisi baru
-        current_vol = get_realized_volatility(closes[:i+1], Config.VOL_WINDOW)
-        if current_vol <= 0:
+        vol = realized_vol(closes[:i+1], Config.VOL_WINDOW)
+        if vol <= 0:
             continue
-            
-        # Volatility Targeting: Size = Target Vol / Realized Vol
-        vol_size = max(Config.SIZE_MIN, min(Config.SIZE_MAX, Config.TARGET_VOL / current_vol))
-        
+        vol_size = max(Config.SIZE_MIN, min(Config.SIZE_MAX, Config.TARGET_VOL / vol))
         pos = new_dir
-        entry_price = curr_price
+        entry_price = closes[i]
         entry_idx = i
-        init_risk = current_atr * Config.INIT_RISK_MULT
-        trail_dist = current_atr * Config.TRAIL_MULT
+        init_risk = a * Config.INIT_RISK_MULT
+        trail_dist = a * Config.TRAIL_MULT
         peak_price = c[i]["high"] if pos == 1 else c[i]["low"]
-        
-        logger.debug(f"[{c[i]['time'].date()}] Entry {'LONG' if pos==1 else 'SHORT'} | Price: {entry_price:.2f} | ATR: {current_atr:.2f} | VolSize: {vol_size:.2f}x")
 
-    # 3. Evaluasi Hasil
-    evaluate_and_report(results, c)
-
-# ==============================================================================
-# 5. PELAPORAN & NOTIFIKASI
-# ==============================================================================
-def evaluate_and_report(results: List[Dict[str, Any]], c: List[Dict[str, Any]]):
+    # --- EVALUASI ---
     n = len(results)
-    logger.info(f"Total trades dieksekusi: {n}")
-    
+    log.info(f"Total trades: {n}")
     if n == 0:
-        send_telegram("<b>⚠️ TSMOM v13.0</b>: 0 trade dieksekusi. Cek parameter atau data.")
+        send_telegram("⚠️ <b>TSMOM v13.0</b>: 0 trade.")
         return
 
-    # Analisis Walk-Forward (4 Segmen)
-    total_bars = len(c)
-    quarter = total_bars // 4
+    # Walk-forward 4 segmen
+    quarter = len(c) // 4
     segs = []
-    for k in range(4):
+    for k in range(Config.NUM_SEGMENTS):
         lo, hi = k * quarter, (k + 1) * quarter
-        seg_results = [r for r in results if lo <= r["idx"] < hi]
-        segs.append(calculate_stats(seg_results, c))
-    
-    ov = calculate_stats(results, c)
+        segs.append(calc_stats([r for r in results if lo <= r["idx"] < hi]))
+    ov = calc_stats(results)
 
-    # Helper format
-    def fmt_stat(name: str, s: Dict[str, Any]) -> str:
-        if s["n"] == 0:
-            return f"  {name:8s}: n=0"
-        pf_str = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "inf"
-        return (f"  {name:8s}: n={s['n']:3d} | WR={s['wr']:5.1f}% | PF={pf_str:>5s} | "
-                f"Exp={s['exp']:+.3f}R | MDD={s['mdd']:.1f}R")
+    avg_hold = sum(r["hold"] for r in results) / n
+    consistent = sum(1 for s in segs if s["n"] > 0 and s["pf"] >= Config.SEG_MIN_PF)
+    ok = (ov["n"] >= Config.MIN_TRADES and ov["pf"] >= Config.MIN_PF and
+          ov["exp"] > Config.MIN_EXP and consistent >= Config.MIN_CONSISTENT)
 
-    logger.info("\n--- 📊 OVERALL PERFORMANCE ---")
-    logger.info(fmt_stat("TOTAL", ov))
-    logger.info("\n--- 📈 WALK-FORWARD (4 Segmen) ---")
-    for k in range(4):
-        logger.info(fmt_stat(f"SEG {k+1}", segs[k]))
+    # --- FORMAT LAPORAN ---
+    def fmt(name, s):
+        if s["n"] == 0: return f"  {name:6s}: n=0"
+        pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "inf"
+        return f"  {name:6s}: n={s['n']:3d} WR={s['wr']:5.1f}% PF={pf_s:>5s} Exp={s['exp']:+.3f}R DD={s['mdd']:.1f}R"
 
-    avg_hold = sum(r["hold"] for r in results) / n if n > 0 else 0
-    logger.info(f"Rata-rata waktu tahan (Avg Hold): {avg_hold:.1f} hari")
-    logger.info(f"Biaya per trade (Friction): {Config.COST_PER_TRADE_R}R")
+    log.info("\n--- OVERALL ---")
+    log.info(fmt("TOTAL", ov))
+    log.info("\n--- 4 SEGMEN ---")
+    for k in range(Config.NUM_SEGMENTS):
+        log.info(fmt(f"S{k+1}", segs[k]))
+    log.info(f"Avg hold: {avg_hold:.1f} hari")
+    log.info(f"Biaya per trade: {Config.COST_PER_TRADE_R}R")
 
-    # Kriteria Kelulusan Live Trading
-    # Minimal 20 trade, PF > 1.3 (lebih realistis dari 1.4 karena sudah ada biaya), Exp > 0.2R, dan minimal 3 segmen konsisten (PF >= 1.1)
-    consistent_segs = sum(1 for s in segs if s["n"] > 0 and s["pf"] >= 1.1)
-    is_live_ready = (ov["n"] >= 20 and ov["pf"] >= 1.3 and ov["exp"] > 0.2 and consistent_segs >= 3)
-
-    # Format Pesan Telegram
-    pf_str = f"{ov['pf']:.2f}" if ov['pf'] != float('inf') else "inf"
+    pf_s = f"{ov['pf']:.2f}" if ov['pf'] != float('inf') else "inf"
     msg = (
-        f"<b>🏆 TSMOM GOLD v13.0 (Ultimate)</b>\n"
-        f"<code>{Config.SYMBOL}</code> | Target Vol: {Config.TARGET_VOL*100:.0f}%\n"
-        f"──────────────────────────────\n"
-        f"📊 Total Trades : {ov['n']}\n"
-        f"🎯 Win Rate     : {ov['wr']:.1f}%\n"
-        f"💵 Profit Factor: {pf_str}\n"
-        f"📈 Expectancy   : {ov['exp']:+.3f} R (Net of fees)\n"
-        f"📉 Max Drawdown : {ov['mdd']:.1f} R\n"
-        f"⚡ Sharpe Ratio : {ov['sharpe']:.2f}\n"
-        f"⏱️ Avg Hold     : {avg_hold:.0f} hari\n"
-        f"──────────────────────────────\n"
-        f"<b>Walk-Forward Consistency:</b>\n"
+        f"<b>🏆 TSMOM GOLD v13.0</b>\n"
+        f"<code>{Config.SYMBOL}</code> | Vol Target: {Config.TARGET_VOL*100:.0f}%\n"
+        f"──────────────────────\n"
+        f"📊 Trades     : {ov['n']}\n"
+        f"🎯 Win Rate   : {ov['wr']:.1f}%\n"
+        f"💵 PF         : {pf_s}\n"
+        f"📈 Expectancy : {ov['exp']:+.3f} R (net)\n"
+        f"📉 Max DD     : {ov['mdd']:.1f} R\n"
+        f"⏱️ Avg Hold   : {avg_hold:.0f} hari\n"
+        f"──────────────────────\n"
+        f"<b>Walk-Forward:</b>\n"
     )
-    for k in range(4):
+    for k in range(Config.NUM_SEGMENTS):
         s = segs[k]
         if s["n"] > 0:
             s_pf = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "inf"
-            msg += f"• Q{k+1}: n={s['n']} | WR={s['wr']:.0f}% | PF={s_pf} | Exp={s['exp']:+.2f}R\n"
-    
-    msg += f"──────────────────────────────\n"
-    msg += f"Konsistensi: {consistent_segs}/4 Segmen\n"
-    if is_live_ready:
-        msg += f"✅ <b>STATUS: LAYAK LIVE TRADING</b>"
-    else:
-        msg += f"⚠️ <b>STATUS: BELUM LAYAK (Perlu Optimasi)</b>"
+            msg += f"• S{k+1}: n={s['n']} WR={s['wr']:.0f}% PF={s_pf} Exp={s['exp']:+.2f}R\n"
+    msg += f"──────────────────────\n"
+    msg += f"Konsistensi: {consistent}/{Config.NUM_SEGMENTS}\n"
+    msg += "✅ <b>LAYAK LIVE</b>" if ok else "⚠️ <b>BELUM LAYAK</b>"
 
-    logger.info("\n" + msg.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
+    log.info("\n" + msg.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
     send_telegram(msg)
 
-def send_telegram(text: str):
-    """Mengirim pesan ke Telegram jika token valid."""
-    if Config.TELEGRAM_TOKEN == "dummy" or Config.TELEGRAM_CHAT_ID == "dummy":
-        logger.info("Telegram tidak dikonfigurasi. Pesan hanya ditampilkan di log.")
-        return
-    
-    url = f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": Config.TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            logger.info("Pesan berhasil dikirim ke Telegram.")
-        else:
-            logger.error(f"Gagal kirim Telegram: {response.text}")
-    except Exception as e:
-        logger.error(f"Exception saat kirim Telegram: {e}")
-
 # ==============================================================================
-# 6. ENTRY POINT
+# 7. ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
     try:
-        run_backtest()
+        run()
     except Exception as e:
         import traceback
-        logger.critical(f"FATAL ERROR: {e}\n{traceback.format_exc()}")
-        send_telegram(f"🚨 <b>FATAL ERROR TSMOM v13.0</b>\n<code>{e}</code>")
+        log.critical(f"FATAL: {e}\n{traceback.format_exc()}")
+        send_telegram(f"🚨 <b>FATAL ERROR</b>\n<code>{e}</code>")
