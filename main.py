@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD GOLD SIGNAL BOT — GitHub Actions Edition v2.0 (FIXED)
+XAUUSD GOLD SIGNAL BOT — GitHub Actions Edition v2.1 (FIXED)
 ================================================================
-Perbaikan dari v1.0:
-  • Data validation (gap, duplikat, None, harga invalid)
-  • Candle-close enforcement (tidak memakai candle in-progress)
-  • Dynamic spot-offset calibration
-  • Weighted voting + prime-hour boost
-  • Position sizing calculator
-  • Open-signal tracking untuk monitoring performa
-  • Retry/backoff Yahoo (query1 → query2 fallback)
-  • ATR/indikator aman saat data minim
+Perbaikan v2.1:
+  • Spot verification: AUTO-CALIBRATION (offset dinamis via EMA)
+  • Skip hanya jika spread melompat tiba-tiba (data korup), bukan karena
+    offset default usang
+  • Weekend gap warning dihilangkan (tidak lagi spam log tiap run)
+  • Sanity check absolut untuk spread ekstrem
+
 Sinyal dikirim ke Telegram untuk eksekusi MANUAL di MT5.
 """
 import os, json, time, math, random, pickle, requests
@@ -45,9 +43,10 @@ ATR_PERIOD = 14
 # Anti-spam
 COOLDOWN_MIN = 90
 
-# Spot verification
-MAX_DEVIATION      = 15.0
-SPOT_OFFSET_DEFAULT = -4.0        # fallback awal; akan dikalibrasi dinamis
+# Spot verification (v2.1 — auto-calibration)
+SPOT_OFFSET_DEFAULT   = -15.0       # initial guess (contango 2026); akan auto-adjust
+MAX_SUDDEN_SHIFT      = 12.0        # skip jika spread lompat > $12 dari EMA
+ABSOLUTE_MAX_SPREAD   = 60.0        # sanity: contango ekstrem / data korup
 
 # ========================== UTILITAS ==========================
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -158,15 +157,24 @@ def fetch_ohlc(interval="30m", rng="5d", drop_incomplete=True):
                         "low": float(l), "close": float(c), "vol": float(v)})
     if len(candles) < 55:
         raise ValueError(f"Data {interval} terlalu sedikit: {len(candles)}")
-    # Deteksi gap besar
+
+    # Deteksi gap besar — abaikan weekend (Jumat 21:00 → Minggu 22:00 UTC)
     for i in range(1, len(candles)):
         gap_min = (candles[i]["time"] - candles[i-1]["time"]).total_seconds()/60
-        if gap_min > step_min * 4:                            # gap >4 bar
-            log(f"WARNING gap {gap_min:.0f} menit pada {candles[i]['time']}")
+        if gap_min <= step_min * 4:
+            continue
+        t_prev = candles[i-1]["time"]
+        t_curr = candles[i]["time"]
+        # Weekend: prev Jumat (wd=4) → curr Sabtu/Minggu (wd>=5)
+        is_weekend = (t_prev.weekday() == 4 and t_curr.weekday() >= 5)
+        if is_weekend:
+            continue                              # normal, bukan error
+        log(f"WARNING gap {gap_min:.0f} menit pada {t_curr} "
+            f"(wd_prev={t_prev.weekday()}, wd_curr={t_curr.weekday()})")
     return candles
 
-def fetch_spot(state):
-    """Multi-source spot; update offset dinamis via EMA."""
+def fetch_spot():
+    """Multi-source spot; ambil median untuk robustness."""
     prices = []
     try:
         p = float(requests.get("https://api.gold-api.com/price/XAU",
@@ -178,9 +186,8 @@ def fetch_spot(state):
                                headers=HEADERS, timeout=6).json()["data"]["amount"])
         prices.append(p)
     except Exception: pass
-    if not prices: return None, state.get("spot_offset", SPOT_OFFSET_DEFAULT)
-    raw = sorted(prices)[len(prices)//2]
-    return raw, state.get("spot_offset", SPOT_OFFSET_DEFAULT)
+    if not prices: return None
+    return sorted(prices)[len(prices)//2]        # median
 
 # ========================== INDIKATOR ==========================
 def ema(vals, n):
@@ -345,14 +352,14 @@ def build_signal(score, sl, tp, price, votes, regime_note, spot_txt, lot):
         f"📦 Saran Lot   : <b>{lot}</b> (risk 1% / equity $1000)\n"
         f"🧠 Skor        : {abs(score):.2f} | {votes}\n"
         f"📊 Regime      : {regime_note}\n"
-        f"🔎 Spot dev    : {spot_txt}\n"
+        f"🔎 Spot        : {spot_txt}\n"
         f"⏰ {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC\n"
         f"⚠️ Eksekusi MANUAL di MT5."
     )
 
 # ========================== MAIN ==========================
 def main():
-    log("=== RUN BOT XAUUSD v2.0 ===")
+    log("=== RUN BOT XAUUSD v2.1 ===")
     state = load_state()
 
     # --- 1. Fetch data ---
@@ -379,17 +386,31 @@ def main():
     hh = datetime.now(timezone.utc).hour
     prime = hh in PRIME_HOURS
 
-    # --- 4. Spot verification + dynamic offset ---
-    spot_raw, offset = fetch_spot(state)
+    # --- 4. Spot verification + AUTO-CALIBRATION (v2.1) ---
+    spot_raw = fetch_spot()
     if spot_raw is not None:
-        spot_cal = spot_raw + offset
-        dev = abs(spot_cal - price)
-        if dev > MAX_DEVIATION:
-            log(f"Deviasi spot {dev:.2f} > {MAX_DEVIATION}. Skip."); return
-        # kalibrasi offset dinamis (EMA α=0.15)
-        new_off = 0.85 * offset + 0.15 * (price - spot_raw)
-        state["spot_offset"] = round(new_off, 2)
-        spot_txt = f"{dev:.2f} USD (offset {new_off:+.2f})"
+        raw_spread = price - spot_raw                        # futures - spot
+        prev_offset = state.get("spot_offset", raw_spread)
+        # EMA α=0.15 (reaktif tapi tidak melompat)
+        new_offset = 0.85 * prev_offset + 0.15 * raw_spread
+        state["spot_offset"] = round(new_offset, 2)
+
+        dev_from_ema = abs(raw_spread - new_offset)
+
+        if dev_from_ema > MAX_SUDDEN_SHIFT:
+            log(f"⚠️ Spot jump {dev_from_ema:.2f} USD dari EMA "
+                f"(raw_spread={raw_spread:.2f}, EMA={new_offset:.2f}). "
+                f"Kemungkinan data korup. Skip.")
+            save_state(state)
+            return
+        if abs(raw_spread) > ABSOLUTE_MAX_SPREAD:
+            log(f"⚠️ Spread absolut {raw_spread:.2f} > {ABSOLUTE_MAX_SPREAD}. Skip.")
+            save_state(state)
+            return
+
+        spot_txt = (f"spread {raw_spread:+.2f} | "
+                    f"EMA {new_offset:+.2f} | "
+                    f"Δ {dev_from_ema:.2f}")
     else:
         spot_txt = "gagal verifikasi (lanjut hati-hati)"
 
@@ -417,7 +438,8 @@ def main():
         same_dir = ((score > 0 and state.get("last_direction") == "BUY") or
                     (score < 0 and state.get("last_direction") == "SELL"))
         if same_dir and mins < COOLDOWN_MIN:
-            log(f"Cooldown aktif ({mins:.0f}/{COOLDOWN_MIN}m). Skip."); return
+            log(f"Cooldown aktif ({mins:.0f}/{COOLDOWN_MIN}m). Skip.")
+            save_state(state); return
 
     # --- 7. ML gate ---
     proba = ml_proba(c30)
@@ -425,7 +447,8 @@ def main():
     if proba is not None:
         ml_txt = f"{proba:.2f}"
         if proba < 0.55:
-            log(f"ML menolak (proba {proba:.2f}). Skip."); return
+            log(f"ML menolak (proba {proba:.2f}). Skip.")
+            save_state(state); return
 
     # --- 8. Emit sinyal ---
     if abs(score) >= MIN_SCORE_WEIGHTED:
@@ -443,7 +466,6 @@ def main():
                 "time": now.isoformat(), "dir": state["last_direction"],
                 "entry": price, "sl": sl, "tp": tp, "status": "PENDING"
             })
-            # simpan max 50 sinyal terakhir
             state["open_signals"] = state["open_signals"][-50:]
             save_state(state)
     else:
