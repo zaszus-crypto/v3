@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD GOLD SIGNAL BOT — v3.0 REGIME-SWITCHING
+XAUUSD GOLD SIGNAL BOT — v3.2 STRICT
 ================================================================
-Berdasarkan diagnostic backtest 60 hari:
-  • SMC_Sweep: PF 0.43 (RUSAK) → DIBUANG
-  • SqueezeBreak: PF 0.64, n=2 → DIBUANG (sampel kecil)
-  • MSB_MultiTF: PF 1.30, n=990 → DIPAKAI saat TRENDING
-  • MeanReversion: PF 2.65, n=42 → DIPAKAI saat RANGING
+Berdasarkan backtest v3.1:
+  • PF 1.34, tapi DD 68.4R (fatal) → sinyal terlalu banyak
+  • MSB n=506 (97% dominan) → filter terlalu longgar
+  • MR n=13, PF 2.92 → kualitas bagus, frekuensi wajar
 
-Regime detection via ADX:
-  ADX > 25 → TRENDING  → MSB_MultiTF
-  ADX < 20 → RANGING   → MeanReversion
-  20-25    → TRANSISI  → skip (tidak trade)
+Perbaikan v3.2:
+  1. MSB diperketat: H1 EMA50 vs EMA200 + M30 EMA stack + slope
+  2. MSB hanya prime hours (12-17 UTC overlap London-NY)
+  3. ADX_TREND 25 → 30
+  4. Equity curve filter: stop entry setelah 4 loss beruntun
 """
 import os, json, time, math, random, pickle, requests
 from datetime import datetime, timezone, timedelta
@@ -29,20 +29,23 @@ MODEL_META_FILE  = os.path.join(STATE_DIR, "ml_meta.json")
 os.makedirs(STATE_DIR, exist_ok=True)
 
 # Sesi (UTC)
-KILLZONES   = [(0, 5), (6, 12), (12, 17)]
-PRIME_HOURS = set(range(12, 17))
+KILLZONES     = [(0, 5), (6, 12), (12, 17)]
+PRIME_HOURS   = set(range(12, 17))    # overlap London-NY
+MSB_HOURS     = PRIME_HOURS            # MSB hanya di prime hours
 
-# Regime thresholds
-ADX_TREND   = 25     # >= ini -> trending (pakai MSB)
-ADX_RANGE   = 20     # <= ini -> ranging (pakai MR)
+# Regime thresholds (v3.2: ADX_TREND naik ke 30)
+ADX_TREND = 30
+ADX_RANGE = 20
 
-# Risk model
+# Risk
 SL_MULT    = 1.8
 RR_TARGET  = 2.5
-ATR_PERIOD = 14
 
 # Anti-spam
 COOLDOWN_MIN = 90
+
+# Equity curve filter
+MAX_CONSEC_LOSS = 4          # stop entry setelah N loss beruntun
 
 # Spot verification
 SPOT_OFFSET_DEFAULT = 15.0
@@ -86,7 +89,8 @@ def send_telegram(text):
 def load_state():
     default = {"last_signal_time": "", "last_direction": "",
                "sent_ids": [], "spot_offset": SPOT_OFFSET_DEFAULT,
-               "spot_samples": 0, "open_signals": []}
+               "spot_samples": 0, "open_signals": [],
+               "consec_losses": 0, "last_outcome": ""}
     try:
         with open(STATE_FILE) as f:
             s = json.load(f)
@@ -222,7 +226,6 @@ def rsi(closes, n=14):
     return 100 - 100/(1+rs)
 
 def adx(candles, n=14):
-    """Average Directional Index (Wilder smoothing)."""
     if len(candles) < 2*n + 2: return 20.0
     trs, pdm, mdm = [], [], []
     for i in range(1, len(candles)):
@@ -239,17 +242,14 @@ def adx(candles, n=14):
             s = s - s/p + v
             out.append(s)
         return out
-    atr_w = wilder(trs, n)
-    pdm_w = wilder(pdm, n)
-    mdm_w = wilder(mdm, n)
+    atr_w = wilder(trs, n); pdm_w = wilder(pdm, n); mdm_w = wilder(mdm, n)
     if not atr_w: return 20.0
     pdi = [100 * a/(b+1e-9) for a, b in zip(pdm_w, atr_w)]
     mdi = [100 * a/(b+1e-9) for a, b in zip(mdm_w, atr_w)]
     dx = [100 * abs(a-b)/(a+b+1e-9) for a, b in zip(pdi, mdi)]
     if len(dx) < n: return sum(dx)/len(dx) if dx else 20.0
     s = sum(dx[:n])
-    for v in dx[n:]:
-        s = s - s/n + v
+    for v in dx[n:]: s = s - s/n + v
     return s/n
 
 def swing_points(candles, lb=5):
@@ -264,18 +264,44 @@ def swing_points(candles, lb=5):
             lows.append(l)
     return highs[-3:], lows[-3:]
 
-# ========================== STRATEGI (hanya yang punya edge) ==========================
-def strat_msb_mtf(c30, c60):
-    """Trend following — proven PF 1.30, n=990."""
-    if len(c60) < 55 or len(c30) < 25: return 0
-    e60 = ema([x["close"] for x in c60], 50)
-    bias = +1 if c60[-1]["close"] > e60 else -1
-    e30 = ema([x["close"] for x in c30], 20)
-    trig = +1 if c30[-1]["close"] > e30 else -1
-    return bias if bias == trig else 0
+# ========================== STRATEGI (v3.2) ==========================
+def strat_msb_strict(c30, c60):
+    """
+    MSB v3.2 — stricter:
+      H1 bias: EMA50 vs EMA200
+      M30 trigger: EMA20 vs EMA50 stack + slope + price position
+      Quality >= 3 dari 3 kondisi
+    """
+    if len(c30) < 55 or len(c60) < 60: return 0
+    closes30 = [x["close"] for x in c30]
+    closes60 = [x["close"] for x in c60]
+
+    # H1 bias
+    e50_60  = ema(closes60, 50)
+    e200_60 = ema(closes60, min(200, len(closes60)))
+    if e50_60 > e200_60:   bias = +1
+    elif e50_60 < e200_60: bias = -1
+    else: return 0
+
+    # M30 stack
+    e20_30 = ema(closes30, 20)
+    e50_30 = ema(closes30, 50)
+    e20_30_prev = ema(closes30[:-5], 20)
+
+    # Quality score (0-3)
+    q = 0
+    if bias == 1:
+        if e20_30 > e50_30:                q += 1   # stack aligned
+        if closes30[-1] > e20_30:          q += 1   # price above EMA20
+        if e20_30 > e20_30_prev:           q += 1   # EMA20 rising
+    else:
+        if e20_30 < e50_30:                q += 1
+        if closes30[-1] < e20_30:          q += 1
+        if e20_30 < e20_30_prev:           q += 1
+
+    return bias if q >= 3 else 0                    # SEMUA kondisi harus terpenuhi
 
 def strat_mean_reversion(c, c60=None):
-    """Counter-trend — proven PF 2.65, n=42."""
     closes = [x["close"] for x in c]
     if len(closes) < 50: return 0
     m = sma(closes, 50)
@@ -298,8 +324,8 @@ def regime_ok(c):
     if px <= 0: return False
     return 0.0008 < a/px < 0.02
 
-def in_killzone():
-    h = datetime.now(timezone.utc).hour
+def in_killzone(hour=None):
+    h = hour if hour is not None else datetime.now(timezone.utc).hour
     return any(a <= h < b for a, b in KILLZONES)
 
 # ========================== ML FILTER ==========================
@@ -355,73 +381,75 @@ def build_signal(score, sl, tp, price, strategy_name, regime, ml_txt,
 
 # ========================== MAIN ==========================
 def main():
-    log("=== RUN BOT XAUUSD v3.0 (REGIME-SWITCHING) ===")
+    log("=== RUN BOT XAUUSD v3.2 (STRICT) ===")
     state = load_state()
 
-    # 1. Fetch data
+    # 1. Fetch
     try:
         c30 = fetch_ohlc("30m", "5d")
         c60 = fetch_ohlc("1h", "1mo")
     except Exception as e:
         log(f"Fetch gagal: {e}"); return
     if len(c30) < 60 or len(c60) < 55:
-        log(f"Data tidak cukup: M30={len(c30)} H1={len(c60)}"); return
+        log(f"Data tidak cukup"); return
 
     price = c30[-1]["close"]
     a     = atr(c30, 14)
-    if a <= 0:
-        log("ATR = 0, skip."); return
+    if a <= 0: log("ATR=0"); return
 
-    # 2. Regime gate (volatilitas)
+    # 2. Regime volatilitas
     if not regime_ok(c30):
-        log("Regime volatilitas ekstrem/sepi. Skip."); return
+        log("Volatilitas ekstrem/sepi. Skip."); return
 
-    # 3. Session gate
-    if not in_killzone():
-        log("Di luar killzone. Skip."); return
+    # 3. Killzone
     hh = datetime.now(timezone.utc).hour
+    if not in_killzone(hh):
+        log(f"Jam {hh} UTC di luar killzone. Skip."); return
     prime = hh in PRIME_HOURS
 
-    # 4. ADX REGIME DETECTION
+    # 4. ADX regime
     adx_val = adx(c30, 14)
     if adx_val >= ADX_TREND:
-        regime = "TRENDING"
-        strategy = "MSB_MultiTF"
-        votes = {"MSB_MultiTF": strat_msb_mtf(c30, c60)}
-        score = votes["MSB_MultiTF"] * 1.5
+        regime = f"TRENDING (ADX {adx_val:.1f})"
+        # MSB HANYA di prime hours
+        if hh not in MSB_HOURS:
+            log(f"ADX trending tapi jam {hh} bukan prime. Skip MSB."); return
+        strategy = "MSB_Strict"
+        score = strat_msb_strict(c30, c60) * 1.5
     elif adx_val <= ADX_RANGE:
-        regime = "RANGING"
+        regime = f"RANGING (ADX {adx_val:.1f})"
         strategy = "MeanReversion"
-        votes = {"MeanReversion": strat_mean_reversion(c30, c60)}
-        score = votes["MeanReversion"] * 2.0
+        score = strat_mean_reversion(c30, c60) * 2.0
     else:
-        log(f"ADX {adx_val:.1f} di zona transisi (20-25). Skip.")
-        return
-    log(f"ADX={adx_val:.1f} | Regime={regime} | Strategy={strategy} | score={score:.2f}")
+        log(f"ADX {adx_val:.1f} zona transisi. Skip."); return
+    log(f"{regime} | {strategy} | score={score:.2f}")
 
-    # 5. Spot verification
+    # 5. Spot
     spot_raw = fetch_spot()
     if spot_raw is not None:
         raw_spread = price - spot_raw
         prev_offset = float(state.get("spot_offset", raw_spread))
-        samples     = int(state.get("spot_samples", 0))
+        samples = int(state.get("spot_samples", 0))
         if abs(raw_spread) > ABSOLUTE_MAX_SPREAD:
-            log(f"⚠️ Spread absolut {raw_spread:.2f} > {ABSOLUTE_MAX_SPREAD}. Skip.")
-            save_state(state); return
-        dev_from_prev = abs(raw_spread - prev_offset)
-        gate_active = samples >= BOOTSTRAP_SAMPLES
-        if gate_active and dev_from_prev > MAX_SUDDEN_SHIFT:
-            log(f"⚠️ Spot jump {dev_from_prev:.2f} > {MAX_SUDDEN_SHIFT}. Skip.")
-            save_state(state); return
-        new_offset = 0.85 * prev_offset + 0.15 * raw_spread
-        state["spot_offset"]  = round(new_offset, 2)
+            log(f"⚠️ Spread {raw_spread:.2f} > max. Skip."); save_state(state); return
+        dev = abs(raw_spread - prev_offset)
+        gate = samples >= BOOTSTRAP_SAMPLES
+        if gate and dev > MAX_SUDDEN_SHIFT:
+            log(f"⚠️ Spot jump {dev:.2f}. Skip."); save_state(state); return
+        new_off = 0.85 * prev_offset + 0.15 * raw_spread
+        state["spot_offset"] = round(new_off, 2)
         state["spot_samples"] = samples + 1
-        mode = "BOOTSTRAP" if not gate_active else "ACTIVE"
-        spot_txt = f"spread {raw_spread:+.2f} | EMA {new_offset:+.2f} | {mode}"
+        spot_txt = f"spread {raw_spread:+.2f} | EMA {new_off:+.2f}"
     else:
         spot_txt = "gagal verifikasi"
 
-    # 6. Cooldown
+    # 6. Equity curve filter
+    consec = int(state.get("consec_losses", 0))
+    if consec >= MAX_CONSEC_LOSS:
+        log(f"Equity filter: {consec} loss beruntun. Skip sampai reset.")
+        save_state(state); return
+
+    # 7. Cooldown
     now = datetime.now(timezone.utc)
     last_t = state.get("last_signal_time")
     if last_t and abs(score) > 0:
@@ -431,19 +459,18 @@ def main():
             mins = 999
         dir_now = "BUY" if score > 0 else "SELL"
         if state.get("last_direction") == dir_now and mins < COOLDOWN_MIN:
-            log(f"Cooldown aktif ({mins:.0f}/{COOLDOWN_MIN}m). Skip.")
+            log(f"Cooldown ({mins:.0f}/{COOLDOWN_MIN}m). Skip.")
             save_state(state); return
 
-    # 7. ML gate
+    # 8. ML
     proba = ml_proba(c30)
     ml_txt = "n/a"
     if proba is not None:
         ml_txt = f"{proba:.2f}"
         if proba < 0.55:
-            log(f"ML menolak (proba {proba:.2f}). Skip.")
-            save_state(state); return
+            log(f"ML tolak ({proba:.2f}). Skip."); save_state(state); return
 
-    # 8. Emit signal — hanya jika strategi vote != 0
+    # 9. Emit
     if abs(score) > 0:
         direction = 1 if score > 0 else -1
         sl = price - direction * SL_MULT * a
@@ -451,8 +478,7 @@ def main():
         lot = calc_lot(price, sl)
         prime_note = " | PRIME" if prime else ""
         msg = build_signal(score, sl, tp, price, strategy,
-                           f"{regime} (ADX {adx_val:.1f}){prime_note}",
-                           ml_txt, spot_txt, lot)
+                           regime + prime_note, ml_txt, spot_txt, lot)
         if send_telegram(msg):
             state["last_signal_time"] = now.isoformat()
             state["last_direction"]   = "BUY" if direction == 1 else "SELL"
@@ -464,7 +490,7 @@ def main():
             state["open_signals"] = state["open_signals"][-50:]
             save_state(state)
     else:
-        log(f"Strategi {strategy} tidak vote (score=0). Tidak ada sinyal.")
+        log(f"{strategy} tidak vote. Tidak ada sinyal.")
     save_state(state)
 
 if __name__ == "__main__":
