@@ -1,0 +1,45 @@
+name: TSMOM Daily Signal
+
+on:
+  # Otomatis setiap hari kerja jam 21:00 UTC = 04:00 WIB
+  schedule:
+    - cron: "0 21 * * 1-5"
+  
+  # Bisa dijalankan manual dari tab Actions
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  daily-signal:
+    name: Cek Sinyal TSMOM Harian
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run TSMOM Backtest & Signal
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python tsmom_gold.py
+
+      - name: Upload logs (jika gagal)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-logs
+          path: logs/
+          retention-days: 7
