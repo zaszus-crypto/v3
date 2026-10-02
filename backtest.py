@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-TSMOM GOLD v12.0 — Time-Series Momentum institutional.
-Basis: Moskowitz-Ooi-Pedersen (2012). State-machine fixed.
-"""
+"""TSMOM v13.0 — + trend strength filter (skip ranging)."""
 import os, sys, math, time, random, requests
 os.environ.setdefault("TELEGRAM_TOKEN", "dummy")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "dummy")
@@ -11,16 +8,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main as M
 from datetime import datetime, timezone, timedelta
 
-LOOKBACK   = 252
-REBALANCE  = 5
-ATR_P      = 20
-INIT_RISK  = 2.0
-TRAIL_MULT = 4.0
-TARGET_VOL = 0.15
-VOL_WINDOW = 20
-SIZE_MIN   = 0.3
-SIZE_MAX   = 3.0
-MAX_HOLD   = 500
+LOOKBACK       = 252
+REBALANCE      = 5
+ATR_P          = 20
+INIT_RISK      = 2.0
+TRAIL_MULT     = 4.0
+TARGET_VOL     = 0.15
+VOL_WINDOW     = 20
+SIZE_MIN       = 0.3
+SIZE_MAX       = 3.0
+MAX_HOLD       = 500
+MIN_TREND_PCT  = 0.05   # 5% minimal 12M return
 
 def fetch_daily(years=10):
     for host in ("query1","query2"):
@@ -87,23 +85,22 @@ def stats(rs):
 
 def run():
     log=M.log
-    log("=== TSMOM GOLD v12.0 ===")
+    log("=== TSMOM v13.0 (trend strength filter) ===")
     c=fetch_daily(10)
     log(f"Daily: {len(c)} ({len(c)/252:.1f} tahun)")
-    if len(c)<400:
-        M.send_telegram("Data kurang"); return
+    if len(c)<400: M.send_telegram("Data kurang"); return
 
     closes=[x["close"] for x in c]
     results=[]
     pos=0; entry_price=0.0; entry_idx=0
     peak_price=0.0; init_risk=0.0; trail_dist=0.0; vol_size=1.0
     last_rebal=-REBALANCE
+    skipped_weak=0
 
     for i in range(LOOKBACK+30, len(c)):
         a=atr(c[:i+1], ATR_P)
         if a<=0: continue
 
-        # 1. Trailing / exit
         if pos != 0:
             hold=i-entry_idx
             exited=False
@@ -130,22 +127,26 @@ def run():
                                 "idx":entry_idx,"hold":hold})
                 pos=0
 
-        # 2. TSMOM signal (weekly rebalance)
         if (i-last_rebal) < REBALANCE: continue
         last_rebal=i
 
         past=closes[i-LOOKBACK]; curr=closes[i]
-        new_dir = +1 if curr>past else -1
+        ret_pct=(curr-past)/past
+
+        # FILTER BARU: skip trend lemah
+        if abs(ret_pct) < MIN_TREND_PCT:
+            skipped_weak += 1
+            continue
+
+        new_dir = +1 if ret_pct > 0 else -1
         if new_dir==pos: continue
 
-        # Close posisi lama kalau ada
         if pos!=0:
             r=(curr-entry_price)/init_risk*vol_size if pos==1 else \
               (entry_price-curr)/init_risk*vol_size
             results.append({"time":str(c[i]["time"]),"dir":pos,"R":r,
                             "idx":entry_idx,"hold":i-entry_idx})
 
-        # Buka posisi baru
         vol=realized_vol(closes[:i+1], VOL_WINDOW)
         if vol<=0: continue
         vol_size=max(SIZE_MIN, min(SIZE_MAX, TARGET_VOL/vol))
@@ -154,9 +155,8 @@ def run():
         peak_price=c[i]["high"] if pos==1 else c[i]["low"]
 
     n=len(results)
-    log(f"Total trades: {n}")
-    if n==0:
-        M.send_telegram("<b>TSMOM v12.0</b>: 0 trade"); return
+    log(f"Trades: {n} | skipped_weak_trend: {skipped_weak}")
+    if n==0: M.send_telegram("<b>v13.0</b>: 0 trade"); return
 
     total=len(c); fourth=total//4
     segs=[]
@@ -177,12 +177,11 @@ def run():
 
     holds=[r["hold"] for r in results]
     avg_hold=sum(holds)/len(holds) if holds else 0
-    log(f"Avg hold: {avg_hold:.1f} hari")
 
     cons=sum(1 for s in segs if s and s["pf"]>=1.3)
-    ok = ov["n"]>=20 and ov["pf"]>=1.4 and ov["exp"]>0.3 and cons>=3
+    ok = ov["n"]>=20 and ov["pf"]>=1.4 and ov["exp"]>0.25 and cons>=3
 
-    msg=(f"<b>📋 TSMOM GOLD v12.0</b>\n"
+    msg=(f"<b>📋 TSMOM v13.0 (+ trend filter)</b>\n"
          f"──────────────────\n"
          f"Total trades  : {ov['n']}\n"
          f"🏆 Win rate   : {ov['wr']:.1f}%\n"
@@ -190,6 +189,7 @@ def run():
          f"📈 Expectancy : {ov['exp']:+.3f} R\n"
          f"📉 Max DD     : {ov['mdd']:.1f} R\n"
          f"⏱ Avg hold    : {avg_hold:.0f} hari\n"
+         f"🚫 Skip weak  : {skipped_weak}\n"
          f"──────────────────\n"
          f"<b>Walk-forward:</b>\n")
     for k in range(4):
