@@ -1,21 +1,17 @@
-name: XAUUSD Signal Bot
+name: ORB Gold Bot
 
 on:
   schedule:
-    # Setiap 30 menit pada menit ke-2 (hindari tabrakan dengan cron lain)
-    - cron: '2,32 * * * *'
+    - cron: '*/15 13-20 * * 1-4'      # Setiap 15 menit, jam 13-20 UTC, Senin-Kamis
+    - cron: '0 14-20 * * 5'            # Jumat hanya cek (optional)
   workflow_dispatch:
     inputs:
       job:
-        description: 'Job type'
+        description: 'Job'
         required: true
         default: 'signal'
         type: choice
-        options:
-          - signal
-          - backtest
-          - diagnostic
-          - retrain_ml
+        options: [signal, backtest]
 
 permissions:
   contents: write
@@ -23,39 +19,26 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+      - run: pip install -r requirements.txt
 
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      - name: Restore state cache
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: state
-          key: bot-state-${{ github.ref }}-${{ github.run_id }}
+          key: orb-state-${{ github.ref }}-${{ github.run_id }}
           restore-keys: |
-            bot-state-${{ github.ref }}-
-            bot-state-
+            orb-state-${{ github.ref }}-
+            orb-state-
 
-      - name: Prepare state dir
-        run: mkdir -p state
+      - run: mkdir -p state
 
-      - name: Retrain ML (opsional)
-        if: github.event.inputs.job == 'retrain_ml'
-        env:
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          STATE_DIR: state
-        run: python ml_engine.py
-
-      - name: Run signal bot
+      - name: Run signal
         if: github.event.inputs.job == 'signal' || github.event.inputs.job == ''
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
@@ -71,17 +54,8 @@ jobs:
           STATE_DIR: state
         run: python backtest.py
 
-      - name: Run diagnostic
-        if: github.event.inputs.job == 'diagnostic'
-        env:
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          STATE_DIR: state
-        run: python diagnostic.py
-
-      - name: Upload state artifact
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: state-${{ github.run_number }}
           path: state/
