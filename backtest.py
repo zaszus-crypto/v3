@@ -1,42 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-BACKTEST v3.5 — 180 hari H1, tanpa equity filter (measure raw edge).
-Fix: equity filter menyebabkan deadlock di backtest (permanen stuck
-setelah 4 loss karena tidak ada trade baru yg dievaluasi).
-"""
+"""ORB BACKTEST — 60 hari data 15m (Yahoo limit)."""
 import os, sys, math
 os.environ.setdefault("TELEGRAM_TOKEN", "dummy")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "dummy")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main as M
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
 
-HOLD_MAX_BARS = 16
-SL_MULT, RR   = 1.8, 2.5
-BURN_IN       = 100
-RANGE_DAYS    = "180d"
+HOLD_MAX_BARS = 24      # 6 jam (24 candle 15m)
 
-def evaluate(c30, i, direction, sl_dist, tp_dist):
-    if i+1 >= len(c30): return 0.0, "NO"
-    entry = c30[i+1]["open"]
-    sl = entry - direction * sl_dist
-    tp = entry + direction * tp_dist
-    if direction == 1:
-        if entry >= tp: return +RR, "TP_GAP"
-        if entry <= sl: return -1.0, "SL_GAP"
-    else:
-        if entry <= tp: return +RR, "TP_GAP"
-        if entry >= sl: return -1.0, "SL_GAP"
-    for j in range(i+1, min(i+1+HOLD_MAX_BARS, len(c30))):
-        h, l = c30[j]["high"], c30[j]["low"]
+def evaluate(c15, i, direction, sl_price, tp_price):
+    if i+1 >= len(c15): return 0.0, "NO"
+    entry = c15[i+1]["open"]
+    sl_dist = abs(entry - sl_price)
+    if sl_dist <= 0: return 0.0, "NO"
+    for j in range(i+1, min(i+1+HOLD_MAX_BARS, len(c15))):
+        h, l = c15[j]["high"], c15[j]["low"]
         if direction == 1:
-            if l <= sl: return -1.0, "SL"
-            if h >= tp: return +RR, "TP"
+            if l <= sl_price: return -1.0, "SL"
+            if h >= tp_price: return (tp_price-entry)/sl_dist, "TP"
         else:
-            if h >= sl: return -1.0, "SL"
-            if l <= tp: return +RR, "TP"
-    c = c30[min(i+1+HOLD_MAX_BARS, len(c30))-1]["close"]
+            if h >= sl_price: return -1.0, "SL"
+            if l <= tp_price: return (entry-tp_price)/sl_dist, "TP"
+    c = c15[min(i+1+HOLD_MAX_BARS, len(c15))-1]["close"]
     return (c - entry)/sl_dist*direction, "TIMEOUT"
 
 def stats(rs):
@@ -53,110 +40,122 @@ def stats(rs):
             "exp": sum(r["R"] for r in rs)/n, "mdd": mdd,
             "tot": sum(r["R"] for r in rs)}
 
-def run_backtest():
+def run():
     log = M.log
-    log(f"=== BACKTEST v3.5 ({RANGE_DAYS} H1, TANPA equity filter) ===")
-    c60_full = M.fetch_ohlc("1h", RANGE_DAYS)
-    log(f"H1: {len(c60_full)} candle")
+    log("=== ORB BACKTEST (60d, 15m) ===")
+    c15 = M.fetch_ohlc("15m", "60d")
+    log(f"Data: {len(c15)} candle")
 
-    total_len = len(c60_full)
-    segment_size = total_len // 3
+    # Group by session date
+    by_date = {}
+    for c in c15:
+        d = c["time"].date()
+        by_date.setdefault(d, []).append(c)
+
     results = []
+    sessions_tested = 0
+    skipped_width = skipped_weekday = skipped_breakout = 0
 
-    for i in range(BURN_IN, total_len - HOLD_MAX_BARS - 2):
-        c30 = c60_full[:i+1]
-        c60 = c30
+    for sess_date in sorted(by_date.keys()):
+        # Skip weekend
+        if sess_date.weekday() >= 5: skipped_weekday += 1; continue
+        if sess_date.weekday() == 4: skipped_weekday += 1; continue  # Jumat
 
-        if not M.regime_ok(c30): continue
-        hh = c30[-1]["time"].hour
-        if not M.in_killzone(hh): continue
+        day_candles = by_date[sess_date]
+        or_data = M.find_opening_range(day_candles, sess_date)
+        if not or_data: continue
 
-        adx_val = M.adx(c30, 14)
-        if adx_val >= M.ADX_TREND:
-            if hh not in M.MSB_HOURS: continue
-            v = M.strat_msb_strict(c30, c60); regime = "TREND"
-        elif adx_val <= M.ADX_RANGE:
-            v = M.strat_mean_reversion(c30, c60); regime = "RANGE"
-        else:
-            continue
-        if v == 0: continue
+        or_pct = or_data["width"] / or_data["high"] * 100
+        if or_pct < M.OR_MIN_PCT or or_pct > M.OR_MAX_PCT:
+            skipped_width += 1; continue
 
-        a = M.atr(c30, 14)
-        if a <= 0: continue
-        r, h = evaluate(c60_full, i, v, SL_MULT*a, SL_MULT*a*RR)
-        seg = min(2, i // segment_size)
-        results.append({"time": str(c30[-1]["time"]), "dir": v, "R": r,
-                        "hasil": h, "regime": regime, "seg": seg,
-                        "adx": round(adx_val, 1)})
+        sessions_tested += 1
+
+        # Cari breakout di window
+        # Loop candle setelah OR selesai
+        post_or = [c for c in day_candles if c["time"] >= or_data["end"]
+                   and c["time"].hour < M.TRADE_END_H]
+
+        found = False
+        for k in range(len(post_or)):
+            # Slice sampai k+1 untuk pastikan tidak "lihat depan"
+            hist = day_candles[:day_candles.index(post_or[k])+1]
+            dir_, bd = M.orb_breakout(hist, or_data, post_or[k]["time"])
+            if dir_ is None: continue
+
+            entry = post_or[k]["close"]
+            if dir_ == 1:
+                sl = or_data["low"] - or_data["width"] * 0.05
+                tp = entry + or_data["width"] * M.RR_TARGET
+            else:
+                sl = or_data["high"] + or_data["width"] * 0.05
+                tp = entry - or_data["width"] * M.RR_TARGET
+
+            # Index di c15_full untuk simulasi
+            idx_in_full = c15.index(post_or[k])
+            r, h = evaluate(c15, idx_in_full, dir_, sl, tp)
+            results.append({"time": str(post_or[k]["time"]), "dir": dir_,
+                            "R": r, "hasil": h, "sess": str(sess_date)})
+            found = True
+            break  # 1 sinyal per session
+
+        if not found: skipped_breakout += 1
 
     n = len(results)
-    log(f"Total sinyal: {n}")
-    if n == 0:
-        M.send_telegram(f"<b>BACKTEST v3.5</b>: 0 sinyal."); return
+    log(f"Sessions dites: {sessions_tested} | sinyal: {n} | "
+        f"skip_weekday={skipped_weekday} skip_width={skipped_width} "
+        f"no_breakout={skipped_breakout}")
 
-    overall = stats(results)
-    seg_stats = [stats([r for r in results if r["seg"] == k]) for k in range(3)]
-    msb_s = stats([r for r in results if r["regime"] == "TREND"])
-    mr_s  = stats([r for r in results if r["regime"] == "RANGE"])
+    if n == 0:
+        M.send_telegram("<b>ORB BACKTEST</b>: 0 sinyal."); return
+
+    st = stats(results)
+    # Per segmen (3)
+    dates = sorted(set(r["sess"] for r in results))
+    if len(dates) >= 3:
+        chunk = len(dates) // 3
+        segs = [set(dates[:chunk]), set(dates[chunk:2*chunk]), set(dates[2*chunk:])]
+    else:
+        segs = [set(dates), set(), set()]
+
+    seg_st = [stats([r for r in results if r["sess"] in s]) for s in segs]
 
     def line(name, s):
-        if s is None: return f"  {name:20s}: n=0"
+        if s is None: return f"  {name:15s}: n=0"
         pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "inf"
-        return (f"  {name:20s}: n={s['n']:3d} WR={s['wr']:5.1f}% "
+        return (f"  {name:15s}: n={s['n']:3d} WR={s['wr']:5.1f}% "
                 f"PF={pf_s:>5s} Exp={s['exp']:+.3f}R DD={s['mdd']:.1f}R")
 
-    log("\n--- OVERALL ---")
-    log(line("TOTAL", overall))
-    log("\n--- PER SEGMEN (walk-forward) ---")
-    for k in range(3):
-        log(line(f"Segmen {k+1}", seg_stats[k]))
-    log("\n--- PER REGIME ---")
-    log(line("Trending MSB", msb_s))
-    log(line("Ranging MR", mr_s))
+    log("\n--- OVERALL ---"); log(line("TOTAL", st))
+    log("\n--- SEGMEN ---")
+    for k in range(3): log(line(f"Segmen {k+1}", seg_st[k]))
 
-    consistent = sum(1 for s in seg_stats if s and s["pf"] >= 1.4)
-    verdict_ok = (overall["n"] >= 50 and overall["pf"] >= 1.4
-                  and overall["exp"] > 0.2 and consistent >= 2)
+    consistent = sum(1 for s in seg_st if s and s["pf"] >= 1.3)
+    ok = st["n"] >= 15 and st["pf"] >= 1.4 and st["exp"] > 0.2 and consistent >= 2
 
-    lines = [f"<b>📋 BACKTEST v3.5 — {RANGE_DAYS} H1</b>", "──────────────────"]
-    if overall:
-        pf_s = f"{overall['pf']:.2f}" if overall['pf'] != float('inf') else "inf"
-        lines += [f"Total sinyal    : {overall['n']}",
-                  f"🏆 Win rate     : {overall['wr']:.1f}%",
-                  f"💵 Profit factor: {pf_s}",
-                  f"📈 Expectancy   : {overall['exp']:+.3f} R",
-                  f"📉 Max DD       : {overall['mdd']:.1f} R"]
-    lines.append("──────────────────")
-    lines.append("<b>Walk-forward 3 segmen:</b>")
+    msg = (f"<b>📋 ORB BACKTEST (60d)</b>\n"
+           f"──────────────────\n"
+           f"Sessions dites: {sessions_tested}\n"
+           f"Total sinyal  : {st['n']}\n"
+           f"🏆 Win rate   : {st['wr']:.1f}%\n"
+           f"💵 PF         : {st['pf']:.2f}\n"
+           f"📈 Expectancy : {st['exp']:+.3f} R\n"
+           f"📉 Max DD     : {st['mdd']:.1f} R\n"
+           f"──────────────────\n"
+           f"<b>Walk-forward:</b>\n")
     for k in range(3):
-        s = seg_stats[k]
+        s = seg_st[k]
         if s:
             pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "inf"
-            lines.append(f"• S{k+1}: n={s['n']} WR={s['wr']:.0f}% "
-                         f"PF={pf_s} Exp={s['exp']:+.2f}R")
+            msg += f"• S{k+1}: n={s['n']} PF={pf_s} Exp={s['exp']:+.2f}R\n"
         else:
-            lines.append(f"• S{k+1}: n=0")
-    lines.append("──────────────────")
-    lines.append("<b>Per regime:</b>")
-    if msb_s:
-        pf_s = f"{msb_s['pf']:.2f}" if msb_s['pf'] != float('inf') else "inf"
-        lines.append(f"• Trend MSB: n={msb_s['n']} WR={msb_s['wr']:.0f}% "
-                     f"PF={pf_s} Exp={msb_s['exp']:+.2f}R")
-    if mr_s:
-        pf_s = f"{mr_s['pf']:.2f}" if mr_s['pf'] != float('inf') else "inf"
-        lines.append(f"• Range MR : n={mr_s['n']} WR={mr_s['wr']:.0f}% "
-                     f"PF={pf_s} Exp={mr_s['exp']:+.2f}R")
-    lines.append("──────────────────")
-    lines.append(f"<b>Konsistensi: {consistent}/3 segmen PF≥1.4</b>")
-    lines.append("✅ LAYAK forward test" if verdict_ok
-                 else "⚠️ BELUM — evaluasi ulang")
-    msg = "\n".join(lines)
+            msg += f"• S{k+1}: n=0\n"
+    msg += "──────────────────\n"
+    msg += "✅ LAYAK forward test" if ok else "⚠️ BELUM — evaluasi ulang"
     log("\n" + msg.replace("<b>","").replace("</b>",""))
     M.send_telegram(msg)
 
 if __name__ == "__main__":
-    try:
-        run_backtest()
+    try: run()
     except Exception as e:
-        import traceback
-        M.log(f"FATAL: {e}\n{traceback.format_exc()}")
+        import traceback; M.log(f"FATAL: {e}\n{traceback.format_exc()}")
