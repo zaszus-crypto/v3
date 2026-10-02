@@ -1,0 +1,53 @@
+name: XAUUSD Signal Bot
+
+on:
+  schedule:
+    - cron: '9,39 * * * *'      # offset menit acak-ish => anti-pola GitHub
+    - cron: '0 0 * * 0'           # Minggu 00:00 UTC: backtest mingguan
+  workflow_dispatch: {}
+
+concurrency:
+  group: gold-bot
+  cancel-in-progress: false     # anti-loop: run tidak saling menimpa
+
+env:
+  TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Restore state (anti-spam persistence)
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: gold-bot-state-${{ github.run_id }}
+          restore-keys: gold-bot-state-
+      - name: Install deps
+        run: pip install requests scikit-learn
+      - name: Run bot
+        run: python main.py
+      - name: Save state for next run
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: gold-bot-state-${{ github.run_id }}
+
+  backtest:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 0 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests scikit-learn
+      - name: Jalankan backtest 60 hari
+        run: python backtest.py
