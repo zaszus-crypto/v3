@@ -31,7 +31,7 @@ KILLZONES     = [(0, 5), (6, 12), (12, 17)]
 PRIME_HOURS   = set(range(12, 17))
 
 # Voting
-MIN_SCORE_WEIGHTED = 2.6
+MIN_SCORE_WEIGHTED = 1.8
 WEIGHTS = {"SMC_Sweep": 1.25, "MSB_MultiTF": 1.15,
            "MeanReversion": 0.80, "SqueezeBreak": 1.00}
 
