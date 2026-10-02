@@ -11,7 +11,11 @@ on:
         required: true
         default: 'signal'
         type: choice
-        options: [signal, backtest, retrain_ml]
+        options:
+          - signal
+          - backtest
+          - diagnostic
+          - retrain_ml
 
 permissions:
   contents: write
@@ -19,7 +23,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +52,7 @@ jobs:
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATE_DIR: state
         run: python ml_engine.py
 
       - name: Run signal bot
@@ -65,6 +70,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_DIR: state
         run: python backtest.py
+
+      - name: Run diagnostic
+        if: github.event.inputs.job == 'diagnostic'
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATE_DIR: state
+        run: python diagnostic.py
 
       - name: Upload state artifact
         if: always()
