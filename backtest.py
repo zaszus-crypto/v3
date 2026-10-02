@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BACKTEST v3.3 — 180 hari + walk-forward 3 segmen + chunked fetch."""
+"""
+BACKTEST v3.4 — 180 hari dengan data H1 (Yahoo limit 30m: 60 hari).
+Mengadaptasi strategi ke timeframe H1 untuk validasi jangka panjang.
+"""
 import os, sys, math
 os.environ.setdefault("TELEGRAM_TOKEN", "dummy")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "dummy")
@@ -8,41 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main as M
 from datetime import timedelta
 
-HOLD_MAX_BARS = 32
+HOLD_MAX_BARS = 16          # 16 jam (setara 32 candle M30)
 SL_MULT, RR   = 1.8, 2.5
-BURN_IN       = 200
+BURN_IN       = 100         # H1 butuh burn-in lebih sedikit
 MAX_CONSEC    = M.MAX_CONSEC_LOSS
 RANGE_DAYS    = "180d"
-
-def resample_30m_to_1h(c30):
-    out, bucket = [], []
-    for c in c30:
-        if bucket and (c["time"].hour != bucket[0]["time"].hour or
-                       (c["time"] - bucket[0]["time"]).total_seconds() >= 3600):
-            if len(bucket) >= 2:
-                out.append({"time": bucket[0]["time"], "open": bucket[0]["open"],
-                            "high": max(b["high"] for b in bucket),
-                            "low":  min(b["low"]  for b in bucket),
-                            "close": bucket[-1]["close"],
-                            "vol":  sum(b.get("vol",0) for b in bucket)})
-            bucket = []
-        bucket.append(c)
-    if len(bucket) >= 2:
-        out.append({"time": bucket[0]["time"], "open": bucket[0]["open"],
-                    "high": max(b["high"] for b in bucket),
-                    "low":  min(b["low"]  for b in bucket),
-                    "close": bucket[-1]["close"],
-                    "vol":  sum(b.get("vol",0) for b in bucket)})
-    return out
-
-def build_h1_map(c30, c60):
-    mapping = [-1] * len(c30); j = -1
-    for i in range(len(c30)):
-        m30_end = c30[i]["time"] + timedelta(minutes=30)
-        while j+1 < len(c60) and (c60[j+1]["time"] + timedelta(minutes=60)) <= m30_end:
-            j += 1
-        mapping[i] = j
-    return mapping
 
 def evaluate(c30, i, direction, sl_dist, tp_dist):
     if i+1 >= len(c30): return 0.0, "NO"
@@ -80,36 +53,23 @@ def stats(rs):
             "exp": sum(r["R"] for r in rs)/n, "mdd": mdd,
             "tot": sum(r["R"] for r in rs)}
 
-def mr_fixed(c30, c60, adx_val):
-    closes = [x["close"] for x in c30]
-    if len(closes) < 50: return 0
-    m = M.sma(closes, 50)
-    sd = math.sqrt(sum((x-m)**2 for x in closes[-50:])/50)
-    if sd == 0: return 0
-    z = (closes[-1] - m) / sd
-    r = M.rsi(closes)
-    if z <= -2.2 and r < 30: return +1
-    if z >= 2.2 and r > 70: return -1
-    return 0
-
 def run_backtest():
     log = M.log
-    log(f"=== BACKTEST v3.3 ({RANGE_DAYS}) ===")
-    c30_full = M.fetch_ohlc("30m", RANGE_DAYS)
-    c60_full = resample_30m_to_1h(c30_full)
-    h1_map = build_h1_map(c30_full, c60_full)
-    log(f"M30: {len(c30_full)} | H1: {len(c60_full)}")
+    log(f"=== BACKTEST v3.4 ({RANGE_DAYS} H1) ===")
+    
+    # Fetch H1 data — tersedia hingga 730 hari
+    c60_full = M.fetch_ohlc("1h", RANGE_DAYS)
+    log(f"H1: {len(c60_full)} candle (dari {RANGE_DAYS})")
 
-    total_len = len(c30_full)
+    total_len = len(c60_full)
     segment_size = total_len // 3
     results = []
     consec_loss = 0
 
     for i in range(BURN_IN, total_len - HOLD_MAX_BARS - 2):
-        c30 = c30_full[:i+1]
-        h1_idx = h1_map[i]
-        if h1_idx < 55: continue
-        c60 = c60_full[:h1_idx+1]
+        c60 = c60_full[:i+1]
+        c30 = c60  # Gunakan H1 sebagai basis untuk semua perhitungan
+
         if not M.regime_ok(c30): continue
         hh = c30[-1]["time"].hour
         if not M.in_killzone(hh): continue
@@ -120,14 +80,14 @@ def run_backtest():
             if hh not in M.MSB_HOURS: continue
             v = M.strat_msb_strict(c30, c60); regime = "TREND"
         elif adx_val <= M.ADX_RANGE:
-            v = mr_fixed(c30, c60, adx_val); regime = "RANGE"
+            v = M.strat_mean_reversion(c30, c60); regime = "RANGE"
         else:
             continue
         if v == 0: continue
 
         a = M.atr(c30, 14)
         if a <= 0: continue
-        r, h = evaluate(c30_full, i, v, SL_MULT*a, SL_MULT*a*RR)
+        r, h = evaluate(c60_full, i, v, SL_MULT*a, SL_MULT*a*RR)
         seg = min(2, i // segment_size)
         results.append({"time": str(c30[-1]["time"]), "dir": v, "R": r,
                         "hasil": h, "regime": regime, "seg": seg})
@@ -135,9 +95,9 @@ def run_backtest():
         else: consec_loss += 1
 
     n = len(results)
-    log(f"Total sinyal: {n} (dari {total_len} candle, {RANGE_DAYS})")
+    log(f"Total sinyal: {n} (dari {total_len} candle H1, {RANGE_DAYS})")
     if n == 0:
-        M.send_telegram(f"<b>BACKTEST v3.3</b>: 0 sinyal di {RANGE_DAYS}."); return
+        M.send_telegram(f"<b>BACKTEST v3.4</b>: 0 sinyal di {RANGE_DAYS} H1."); return
 
     overall = stats(results)
     seg_stats = [stats([r for r in results if r["seg"] == k]) for k in range(3)]
@@ -164,7 +124,7 @@ def run_backtest():
                   and overall["exp"] > 0.25 and overall["mdd"] < 30
                   and consistent)
 
-    lines = [f"<b>📋 BACKTEST v3.3 — {RANGE_DAYS}</b>", "──────────────────"]
+    lines = [f"<b>📋 BACKTEST v3.4 — {RANGE_DAYS} H1</b>", "──────────────────"]
     if overall:
         pf_s = f"{overall['pf']:.2f}" if overall['pf'] != float('inf') else "inf"
         lines += [f"Total sinyal    : {overall['n']}",
@@ -194,6 +154,8 @@ def run_backtest():
                  f"{sum(1 for s in seg_stats if s and s['pf'] >= 1.4)}/3 segmen PF>=1.4</b>")
     lines.append("✅ LAYAK forward test" if verdict_ok
                  else "⚠️ BELUM — butuh n>=30 + PF>=1.5 di >=2 segmen")
+    lines.append("<i>Catatan: backtest H1 untuk validasi jangka panjang. "
+                 "Hasil M30 60-hari tetap valid untuk timeframe asli.</i>")
 
     msg = "\n".join(lines)
     log("\n" + msg.replace("<b>","").replace("</b>",""))
