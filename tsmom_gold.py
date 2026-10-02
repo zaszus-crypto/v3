@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSMOM GOLD v13.0 ALL-IN-ONE
-Time-Series Momentum Institutional Grade — Single File Edition.
+TSMOM GOLD v13.1 (Optimized) — Time-Series Momentum + SMA Regime Filter
 Basis: Moskowitz-Ooi-Pedersen (2012) + Volatility Targeting + Realistic Frictions.
-
-CARA PAKAI:
-  1. Install requests:  pip install requests
-  2. (Opsional) Set env var untuk Telegram:
-       export TELEGRAM_TOKEN="token_anda"
-       export TELEGRAM_CHAT_ID="chat_id_anda"
-  3. Jalankan:  python tsmom_gold.py
+Optimasi: SMA 200 filter, tighter risk management, lower vol target.
 """
 import os
 import sys
@@ -23,21 +16,21 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
 
 # ==============================================================================
-# 1. KONFIGURASI (UBAH DI SINI)
+# 1. KONFIGURASI (OPTIMIZED)
 # ==============================================================================
 class Config:
-    # --- Strategi ---
+    # --- Strategi (Dioptimalkan untuk kurangi Drawdown) ---
     SYMBOL          = "GC=F"
-    LOOKBACK        = 252       # Periode momentum (hari)
-    REBALANCE       = 5         # Cek sinyal tiap 5 hari
+    LOOKBACK        = 200       # Diperpendek (dari 252) agar lebih responsif
+    REBALANCE       = 5         # Cek sinyal mingguan
     ATR_P           = 20        # Periode ATR
-    INIT_RISK_MULT  = 2.0       # SL awal = 2x ATR
-    TRAIL_MULT      = 4.0       # Trailing stop = 4x ATR
-    TARGET_VOL      = 0.15      # Target volatilitas tahunan (15%)
+    INIT_RISK_MULT  = 1.5       # Diperketat (dari 2.0) — cut loss lebih cepat
+    TRAIL_MULT      = 3.0       # Diperketat (dari 4.0) — kunci profit lebih awal
+    TARGET_VOL      = 0.10      # Lebih konservatif (dari 0.15)
     VOL_WINDOW      = 20        # Jendela volatilitas
     SIZE_MIN        = 0.3       # Leverage min
-    SIZE_MAX        = 3.0       # Leverage max
-    MAX_HOLD        = 500       # Max hari hold
+    SIZE_MAX        = 2.0       # Dikurangi (dari 3.0) — batasi leverage
+    MAX_HOLD        = 300       # Dari 500 — jangan tahan terlalu lama
     COST_PER_TRADE_R = 0.15     # Biaya per trade (R-multiple)
     
     # --- Data ---
@@ -52,7 +45,7 @@ class Config:
     SEG_MIN_PF      = 1.1
     NUM_SEGMENTS    = 4
     
-    # --- Telegram (isi langsung atau via env var) ---
+    # --- Telegram ---
     TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -70,7 +63,6 @@ log = logging.getLogger("TSMOM")
 # 3. TELEGRAM
 # ==============================================================================
 def send_telegram(text: str):
-    """Kirim ke Telegram jika token tersedia."""
     token = Config.TELEGRAM_TOKEN
     chat_id = Config.TELEGRAM_CHAT_ID
     if not token or not chat_id:
@@ -152,6 +144,12 @@ def atr(data: List[Dict[str, Any]], n: int = 20) -> float:
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-n:]) / min(n, len(trs))
 
+def sma(closes: List[float], n: int = 200) -> float:
+    """Simple Moving Average — digunakan sebagai Regime Filter."""
+    if len(closes) < n:
+        return 0.0
+    return sum(closes[-n:]) / n
+
 def calc_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     n = len(results)
     empty = {"n": 0, "wr": 0.0, "pf": 0.0, "exp": 0.0, "mdd": 0.0, "tot": 0.0}
@@ -178,7 +176,7 @@ def calc_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 # 6. BACKTEST ENGINE
 # ==============================================================================
 def run():
-    log.info(f"=== 🚀 TSMOM GOLD v13.0 ALL-IN-ONE ===")
+    log.info(f"=== 🚀 TSMOM GOLD v13.1 (Optimized) ===")
     c = fetch_daily(Config.DATA_YEARS)
     log.info(f"Data: {len(c)} bar ({len(c)/252:.1f} tahun)")
     
@@ -191,6 +189,7 @@ def run():
     pos = 0; entry_price = 0.0; entry_idx = 0
     peak_price = 0.0; init_risk = 0.0; trail_dist = 0.0; vol_size = 1.0
     last_rebal = -Config.REBALANCE
+    skipped_by_filter = 0
 
     for i in range(Config.LOOKBACK + 30, len(c)):
         a = atr(c[:i+1], Config.ATR_P)
@@ -230,15 +229,28 @@ def run():
                 })
                 pos = 0
 
-        # --- ENTRY (mingguan) ---
+        # --- ENTRY (mingguan) + SMA 200 FILTER ---
         if (i - last_rebal) < Config.REBALANCE:
             continue
         last_rebal = i
 
+        # 1. Sinyal momentum dasar
         new_dir = 1 if closes[i] > closes[i - Config.LOOKBACK] else -1
-        if new_dir == pos:
+        
+        # 2. REGIME FILTER: SMA 200
+        # Hanya ambil LONG jika harga > SMA 200, dan SHORT jika harga < SMA 200
+        current_sma = sma(closes[:i+1], 200)
+        if new_dir == 1 and closes[i] <= current_sma:
+            new_dir = 0  # Batalkan sinyal Long (harga di bawah SMA 200)
+            skipped_by_filter += 1
+        elif new_dir == -1 and closes[i] >= current_sma:
+            new_dir = 0  # Batalkan sinyal Short (harga di atas SMA 200)
+            skipped_by_filter += 1
+            
+        if new_dir == 0 or new_dir == pos:
             continue
 
+        # Close posisi lama jika ada (signal reversal)
         if pos != 0:
             raw = (closes[i] - entry_price) * pos
             r_gross = (raw / init_risk) * vol_size
@@ -248,6 +260,7 @@ def run():
                 "idx": entry_idx, "hold": i - entry_idx
             })
 
+        # Buka posisi baru dengan volatility targeting
         vol = realized_vol(closes[:i+1], Config.VOL_WINDOW)
         if vol <= 0:
             continue
@@ -261,9 +274,9 @@ def run():
 
     # --- EVALUASI ---
     n = len(results)
-    log.info(f"Total trades: {n}")
+    log.info(f"Total trades: {n} (Sinyal difilter oleh SMA 200: {skipped_by_filter})")
     if n == 0:
-        send_telegram("⚠️ <b>TSMOM v13.0</b>: 0 trade.")
+        send_telegram("⚠️ <b>TSMOM v13.1</b>: 0 trade setelah filter SMA 200.")
         return
 
     # Walk-forward 4 segmen
@@ -292,11 +305,13 @@ def run():
         log.info(fmt(f"S{k+1}", segs[k]))
     log.info(f"Avg hold: {avg_hold:.1f} hari")
     log.info(f"Biaya per trade: {Config.COST_PER_TRADE_R}R")
+    log.info(f"Sinyal difilter (SMA 200): {skipped_by_filter}")
 
     pf_s = f"{ov['pf']:.2f}" if ov['pf'] != float('inf') else "inf"
     msg = (
-        f"<b>🏆 TSMOM GOLD v13.0</b>\n"
+        f"<b>🏆 TSMOM GOLD v13.1 (Optimized)</b>\n"
         f"<code>{Config.SYMBOL}</code> | Vol Target: {Config.TARGET_VOL*100:.0f}%\n"
+        f"🔍 Filter: SMA 200 + Tighter Risk\n"
         f"──────────────────────\n"
         f"📊 Trades     : {ov['n']}\n"
         f"🎯 Win Rate   : {ov['wr']:.1f}%\n"
@@ -304,6 +319,7 @@ def run():
         f"📈 Expectancy : {ov['exp']:+.3f} R (net)\n"
         f"📉 Max DD     : {ov['mdd']:.1f} R\n"
         f"⏱️ Avg Hold   : {avg_hold:.0f} hari\n"
+        f"🚫 Filtered   : {skipped_by_filter} sinyal\n"
         f"──────────────────────\n"
         f"<b>Walk-Forward:</b>\n"
     )
