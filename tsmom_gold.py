@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSMOM GOLD v13.1 (Optimized) — Time-Series Momentum + SMA Regime Filter
-Basis: Moskowitz-Ooi-Pedersen (2012) + Volatility Targeting + Realistic Frictions.
-Optimasi: SMA 200 filter, tighter risk management, lower vol target.
+TSMOM GOLD v13.2 (ADX Filter) — Only trade when trend is strong.
+Basis: Moskowitz-Ooi-Pedersen (2012) + ADX Regime Filter.
 """
 import os
 import sys
@@ -16,28 +15,28 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
 
 # ==============================================================================
-# 1. KONFIGURASI (OPTIMIZED)
+# 1. KONFIGURASI
 # ==============================================================================
 class Config:
-    # --- Strategi (Dioptimalkan untuk kurangi Drawdown) ---
     SYMBOL          = "GC=F"
-    LOOKBACK        = 200       # Diperpendek (dari 252) agar lebih responsif
-    REBALANCE       = 5         # Cek sinyal mingguan
-    ATR_P           = 20        # Periode ATR
-    INIT_RISK_MULT  = 1.5       # Diperketat (dari 2.0) — cut loss lebih cepat
-    TRAIL_MULT      = 3.0       # Diperketat (dari 4.0) — kunci profit lebih awal
-    TARGET_VOL      = 0.10      # Lebih konservatif (dari 0.15)
-    VOL_WINDOW      = 20        # Jendela volatilitas
-    SIZE_MIN        = 0.3       # Leverage min
-    SIZE_MAX        = 2.0       # Dikurangi (dari 3.0) — batasi leverage
-    MAX_HOLD        = 300       # Dari 500 — jangan tahan terlalu lama
-    COST_PER_TRADE_R = 0.15     # Biaya per trade (R-multiple)
+    LOOKBACK        = 252       # Kembali ke 252 (lebih stabil)
+    REBALANCE       = 5
+    ATR_P           = 20
+    INIT_RISK_MULT  = 2.0       # Kembali ke 2.0 (beri ruang)
+    TRAIL_MULT      = 4.0       # Kembali ke 4.0
+    TARGET_VOL      = 0.12      # Tengah-tengah (dari 0.15 dan 0.10)
+    VOL_WINDOW      = 20
+    SIZE_MIN        = 0.3
+    SIZE_MAX        = 2.5
+    MAX_HOLD        = 400
     
-    # --- Data ---
+    # --- ADX FILTER (KUNCI UTAMA) ---
+    ADX_PERIOD      = 14        # Periode ADX
+    ADX_THRESHOLD   = 25        # Minimum ADX untuk trade (25 = tren kuat)
+    
+    COST_PER_TRADE_R = 0.15
     DATA_YEARS      = 10
     MIN_BARS        = 400
-    
-    # --- Validasi "Layak Live" ---
     MIN_TRADES      = 20
     MIN_PF          = 1.3
     MIN_EXP         = 0.2
@@ -45,12 +44,11 @@ class Config:
     SEG_MIN_PF      = 1.1
     NUM_SEGMENTS    = 4
     
-    # --- Telegram ---
     TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ==============================================================================
-# 2. LOGGING
+# 2. LOGGING & TELEGRAM
 # ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -59,14 +57,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("TSMOM")
 
-# ==============================================================================
-# 3. TELEGRAM
-# ==============================================================================
 def send_telegram(text: str):
     token = Config.TELEGRAM_TOKEN
     chat_id = Config.TELEGRAM_CHAT_ID
     if not token or not chat_id:
-        log.info("Telegram tidak dikonfigurasi. Pesan hanya di log.")
+        log.info("Telegram tidak dikonfigurasi.")
         return
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -81,7 +76,7 @@ def send_telegram(text: str):
         log.error(f"Telegram error: {e}")
 
 # ==============================================================================
-# 4. DATA FETCHER
+# 3. DATA FETCHER
 # ==============================================================================
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -125,7 +120,7 @@ def _parse(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 # ==============================================================================
-# 5. INDIKATOR & STATISTIK
+# 4. INDIKATOR
 # ==============================================================================
 def realized_vol(closes: List[float], w: int = 20) -> float:
     if len(closes) < w + 1:
@@ -144,11 +139,60 @@ def atr(data: List[Dict[str, Any]], n: int = 20) -> float:
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-n:]) / min(n, len(trs))
 
-def sma(closes: List[float], n: int = 200) -> float:
-    """Simple Moving Average — digunakan sebagai Regime Filter."""
-    if len(closes) < n:
+def calculate_adx(data: List[Dict[str, Any]], period: int = 14) -> float:
+    """
+    Average Directional Index (ADX) — mengukur kekuatan tren.
+    ADX > 25 = tren kuat, ADX < 20 = sideways.
+    """
+    if len(data) < period * 2:
         return 0.0
-    return sum(closes[-n:]) / n
+    
+    # Hitung +DM, -DM, TR
+    plus_dm = []
+    minus_dm = []
+    tr_list = []
+    
+    for i in range(1, len(data)):
+        h_diff = data[i]["high"] - data[i-1]["high"]
+        l_diff = data[i-1]["low"] - data[i]["low"]
+        
+        plus_dm.append(h_diff if h_diff > l_diff and h_diff > 0 else 0)
+        minus_dm.append(l_diff if l_diff > h_diff and l_diff > 0 else 0)
+        
+        h, l, pc = data[i]["high"], data[i]["low"], data[i-1]["close"]
+        tr_list.append(max(h - l, abs(h - pc), abs(l - pc)))
+    
+    # Wilder's smoothing (EMA-like)
+    def wilder_smooth(values, period):
+        if len(values) < period:
+            return []
+        smoothed = [sum(values[:period])]
+        for i in range(period, len(values)):
+            smoothed.append(smoothed[-1] - smoothed[-1]/period + values[i])
+        return smoothed
+    
+    plus_dm_smooth = wilder_smooth(plus_dm, period)
+    minus_dm_smooth = wilder_smooth(minus_dm, period)
+    tr_smooth = wilder_smooth(tr_list, period)
+    
+    # Hitung DX
+    dx_list = []
+    for i in range(len(plus_dm_smooth)):
+        if tr_smooth[i] == 0:
+            dx_list.append(0)
+            continue
+        plus_di = 100 * plus_dm_smooth[i] / tr_smooth[i]
+        minus_di = 100 * minus_dm_smooth[i] / tr_smooth[i]
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            dx_list.append(0)
+        else:
+            dx_list.append(100 * abs(plus_di - minus_di) / di_sum)
+    
+    # ADX = rata-rata DX terakhir
+    if len(dx_list) < period:
+        return 0.0
+    return sum(dx_list[-period:]) / period
 
 def calc_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     n = len(results)
@@ -173,10 +217,10 @@ def calc_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "exp": tot/n, "mdd": mdd, "tot": tot}
 
 # ==============================================================================
-# 6. BACKTEST ENGINE
+# 5. BACKTEST ENGINE
 # ==============================================================================
 def run():
-    log.info(f"=== 🚀 TSMOM GOLD v13.1 (Optimized) ===")
+    log.info(f"=== 🚀 TSMOM GOLD v13.2 (ADX Filter) ===")
     c = fetch_daily(Config.DATA_YEARS)
     log.info(f"Data: {len(c)} bar ({len(c)/252:.1f} tahun)")
     
@@ -189,9 +233,9 @@ def run():
     pos = 0; entry_price = 0.0; entry_idx = 0
     peak_price = 0.0; init_risk = 0.0; trail_dist = 0.0; vol_size = 1.0
     last_rebal = -Config.REBALANCE
-    skipped_by_filter = 0
+    skipped_by_adx = 0
 
-    for i in range(Config.LOOKBACK + 30, len(c)):
+    for i in range(Config.LOOKBACK + 50, len(c)):
         a = atr(c[:i+1], Config.ATR_P)
         if a <= 0:
             continue
@@ -229,28 +273,26 @@ def run():
                 })
                 pos = 0
 
-        # --- ENTRY (mingguan) + SMA 200 FILTER ---
+        # --- ENTRY (mingguan) + ADX FILTER ---
         if (i - last_rebal) < Config.REBALANCE:
             continue
         last_rebal = i
 
-        # 1. Sinyal momentum dasar
+        # 1. Hitung ADX
+        current_adx = calculate_adx(c[:i+1], Config.ADX_PERIOD)
+        
+        # 2. ADX FILTER: Hanya trade jika ADX > threshold (tren kuat)
+        if current_adx < Config.ADX_THRESHOLD:
+            skipped_by_adx += 1
+            continue
+        
+        # 3. Sinyal momentum dasar
         new_dir = 1 if closes[i] > closes[i - Config.LOOKBACK] else -1
         
-        # 2. REGIME FILTER: SMA 200
-        # Hanya ambil LONG jika harga > SMA 200, dan SHORT jika harga < SMA 200
-        current_sma = sma(closes[:i+1], 200)
-        if new_dir == 1 and closes[i] <= current_sma:
-            new_dir = 0  # Batalkan sinyal Long (harga di bawah SMA 200)
-            skipped_by_filter += 1
-        elif new_dir == -1 and closes[i] >= current_sma:
-            new_dir = 0  # Batalkan sinyal Short (harga di atas SMA 200)
-            skipped_by_filter += 1
-            
-        if new_dir == 0 or new_dir == pos:
+        if new_dir == pos:
             continue
 
-        # Close posisi lama jika ada (signal reversal)
+        # Close posisi lama jika ada
         if pos != 0:
             raw = (closes[i] - entry_price) * pos
             r_gross = (raw / init_risk) * vol_size
@@ -260,7 +302,7 @@ def run():
                 "idx": entry_idx, "hold": i - entry_idx
             })
 
-        # Buka posisi baru dengan volatility targeting
+        # Buka posisi baru
         vol = realized_vol(closes[:i+1], Config.VOL_WINDOW)
         if vol <= 0:
             continue
@@ -274,12 +316,11 @@ def run():
 
     # --- EVALUASI ---
     n = len(results)
-    log.info(f"Total trades: {n} (Sinyal difilter oleh SMA 200: {skipped_by_filter})")
+    log.info(f"Total trades: {n} (Difilter oleh ADX: {skipped_by_adx})")
     if n == 0:
-        send_telegram("⚠️ <b>TSMOM v13.1</b>: 0 trade setelah filter SMA 200.")
+        send_telegram("⚠️ <b>TSMOM v13.2</b>: 0 trade setelah filter ADX.")
         return
 
-    # Walk-forward 4 segmen
     quarter = len(c) // 4
     segs = []
     for k in range(Config.NUM_SEGMENTS):
@@ -292,7 +333,6 @@ def run():
     ok = (ov["n"] >= Config.MIN_TRADES and ov["pf"] >= Config.MIN_PF and
           ov["exp"] > Config.MIN_EXP and consistent >= Config.MIN_CONSISTENT)
 
-    # --- FORMAT LAPORAN ---
     def fmt(name, s):
         if s["n"] == 0: return f"  {name:6s}: n=0"
         pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "inf"
@@ -305,13 +345,13 @@ def run():
         log.info(fmt(f"S{k+1}", segs[k]))
     log.info(f"Avg hold: {avg_hold:.1f} hari")
     log.info(f"Biaya per trade: {Config.COST_PER_TRADE_R}R")
-    log.info(f"Sinyal difilter (SMA 200): {skipped_by_filter}")
+    log.info(f"Sinyal difilter (ADX < {Config.ADX_THRESHOLD}): {skipped_by_adx}")
 
     pf_s = f"{ov['pf']:.2f}" if ov['pf'] != float('inf') else "inf"
     msg = (
-        f"<b>🏆 TSMOM GOLD v13.1 (Optimized)</b>\n"
+        f"<b>🏆 TSMOM GOLD v13.2 (ADX Filter)</b>\n"
         f"<code>{Config.SYMBOL}</code> | Vol Target: {Config.TARGET_VOL*100:.0f}%\n"
-        f"🔍 Filter: SMA 200 + Tighter Risk\n"
+        f"🔍 Filter: ADX > {Config.ADX_THRESHOLD} (tren kuat saja)\n"
         f"──────────────────────\n"
         f"📊 Trades     : {ov['n']}\n"
         f"🎯 Win Rate   : {ov['wr']:.1f}%\n"
@@ -319,7 +359,7 @@ def run():
         f"📈 Expectancy : {ov['exp']:+.3f} R (net)\n"
         f"📉 Max DD     : {ov['mdd']:.1f} R\n"
         f"⏱️ Avg Hold   : {avg_hold:.0f} hari\n"
-        f"🚫 Filtered   : {skipped_by_filter} sinyal\n"
+        f"🚫 Filtered   : {skipped_by_adx} sinyal\n"
         f"──────────────────────\n"
         f"<b>Walk-Forward:</b>\n"
     )
@@ -336,7 +376,7 @@ def run():
     send_telegram(msg)
 
 # ==============================================================================
-# 7. ENTRY POINT
+# 6. ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
     try:
