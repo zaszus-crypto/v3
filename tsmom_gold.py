@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSMOM GOLD v15.1 (Production-Ready)
-Multi-Layer Confirmation + Graceful Degradation + Data Freshness Check.
+TSMOM GOLD v15.2 (HTML Escape + Spot Gold)
+Fix: Telegram HTML parsing error + Support XAU/USD spot price.
 """
 import os
 import sys
@@ -18,8 +18,13 @@ from typing import List, Dict, Any, Optional
 # 1. KONFIGURASI
 # ==============================================================================
 class Config:
-    VERSION         = "15.1"
-    SYMBOL          = "GC=F"
+    VERSION         = "15.2"
+    
+    # --- SYMBOL (Spot vs Futures) ---
+    SPOT_GOLD_SYMBOL = "XAUUSD=X"    # Spot gold (sesuai MT5)
+    FUTURES_GOLD_SYMBOL = "GC=F"     # Gold futures (fallback)
+    USE_SPOT_FIRST   = True          # Coba spot dulu, fallback ke futures
+    
     LOOKBACK        = 252
     REBALANCE       = 5
     ATR_P           = 20
@@ -55,10 +60,10 @@ class Config:
     SMA_PROXIMITY_PCT = 2.0
     
     # --- PRODUKTION SAFETY ---
-    FETCH_DELAY     = 1.5       # Delay antar fetch (hindari rate limit)
-    FETCH_TIMEOUT   = 30        # Timeout per request
-    MAX_TELEGRAM_LEN = 4000     # Telegram limit 4096, kita pakai 4000 untuk aman
-    SKIP_WEEKEND    = True      # Skip jalankan di weekend
+    FETCH_DELAY     = 1.5
+    FETCH_TIMEOUT   = 30
+    MAX_TELEGRAM_LEN = 4000
+    SKIP_WEEKEND    = True
     DATA_YEARS      = 10
     MIN_BARS        = 400
     
@@ -75,12 +80,31 @@ logging.basicConfig(
 )
 log = logging.getLogger("TSMOM")
 
+def escape_html(text: str) -> str:
+    """
+    Escape karakter HTML berbahaya tapi pertahankan tag yang diizinkan.
+    Mencegah error: 'Unsupported start tag' di Telegram.
+    """
+    # Escape semua karakter berbahaya
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+    
+    # Kembalikan tag HTML yang diizinkan
+    for tag in ['b', '/b', 'i', '/i', 'code', '/code']:
+        text = text.replace(f'&lt;{tag}&gt;', f'<{tag}>')
+    
+    return text
+
 def send_telegram(text: str):
     token = Config.TELEGRAM_TOKEN
     chat_id = Config.TELEGRAM_CHAT_ID
     if not token or not chat_id:
         log.info("Telegram tidak dikonfigurasi.")
         return
+    
+    # Escape HTML characters
+    text = escape_html(text)
     
     # Truncate jika terlalu panjang
     if len(text) > Config.MAX_TELEGRAM_LEN:
@@ -99,7 +123,7 @@ def send_telegram(text: str):
         log.error(f"Telegram error: {e}")
 
 # ==============================================================================
-# 3. DATA FETCHER (with graceful degradation)
+# 3. DATA FETCHER (with spot/futures fallback)
 # ==============================================================================
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -108,12 +132,7 @@ HEADERS = {
 
 def fetch_data(symbol: str, interval: str = "1d", years: int = 10, 
                required: bool = True) -> Optional[List[Dict[str, Any]]]:
-    """
-    Fetch data dengan graceful degradation.
-    required=True → raise error jika gagal (untuk data utama)
-    required=False → return None jika gagal (untuk data pendukung)
-    """
-    # Delay untuk hindari rate limit
+    """Fetch data dengan graceful degradation."""
     time.sleep(Config.FETCH_DELAY)
     
     for host in ("query1", "query2"):
@@ -135,6 +154,26 @@ def fetch_data(symbol: str, interval: str = "1d", years: int = 10,
     else:
         log.warning(f"Data opsional {symbol} tidak tersedia, skip layer ini.")
         return None
+
+def fetch_gold_data() -> tuple[List[Dict[str, Any]], str]:
+    """
+    Fetch gold data dengan fallback: spot (XAUUSD=X) → futures (GC=F).
+    Return: (data, symbol_used)
+    """
+    if Config.USE_SPOT_FIRST:
+        # Coba spot dulu
+        log.info(f"Fetching spot gold ({Config.SPOT_GOLD_SYMBOL})...")
+        data = fetch_data(Config.SPOT_GOLD_SYMBOL, "1d", Config.DATA_YEARS, required=False)
+        if data and len(data) >= Config.MIN_BARS:
+            log.info(f"✅ Spot gold data loaded: {len(data)} bars")
+            return data, Config.SPOT_GOLD_SYMBOL
+        else:
+            log.warning(f"Spot gold tidak tersedia/cukup, fallback ke futures...")
+    
+    # Fallback ke futures
+    log.info(f"Fetching gold futures ({Config.FUTURES_GOLD_SYMBOL})...")
+    data = fetch_data(Config.FUTURES_GOLD_SYMBOL, "1d", Config.DATA_YEARS, required=True)
+    return data, Config.FUTURES_GOLD_SYMBOL
 
 def _parse(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     result = data["chart"]["result"][0]
@@ -249,7 +288,6 @@ def calculate_correlation(series1: List[float], series2: List[float], n: int = 2
 # 5. DATA FRESHNESS CHECK
 # ==============================================================================
 def check_data_freshness(data: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Cek apakah data masih fresh (tidak basi)."""
     if not data:
         return {"fresh": False, "reason": "Data kosong"}
     
@@ -257,7 +295,6 @@ def check_data_freshness(data: List[Dict[str, Any]]) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     age_hours = (now - last_bar).total_seconds() / 3600
     
-    # Data daily harus < 48 jam (untuk antisipasi weekend)
     if age_hours > 48:
         return {
             "fresh": False, 
@@ -267,31 +304,25 @@ def check_data_freshness(data: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"fresh": True, "last_update": last_bar, "age_hours": age_hours}
 
 def is_weekend() -> bool:
-    """Cek apakah sekarang weekend (Sabtu=5, Minggu=6)."""
-    now = datetime.now(timezone.utc) + timedelta(hours=7)  # WIB
+    now = datetime.now(timezone.utc) + timedelta(hours=7)
     return now.weekday() >= 5
 
 # ==============================================================================
 # 6. MULTI-LAYER ANALYSIS
 # ==============================================================================
 def analyze_multi_layer() -> Dict[str, Any]:
-    """Analisis multi-layer dengan graceful degradation."""
-    
-    # 1. Cek weekend
     if Config.SKIP_WEEKEND and is_weekend():
         return {"signal": "SKIP", "reason": "Weekend — pasar tutup"}
     
-    # 2. Fetch data Gold (WAJIB)
-    log.info("Fetching Gold daily data...")
-    gold_data = fetch_data(Config.SYMBOL, "1d", Config.DATA_YEARS, required=True)
+    # Fetch gold data dengan fallback
+    gold_data, symbol_used = fetch_gold_data()
     
-    # 3. Cek freshness data
     freshness = check_data_freshness(gold_data)
     if not freshness["fresh"]:
         return {"signal": "SKIP", "reason": freshness["reason"]}
     
     if len(gold_data) < Config.LOOKBACK + 50:
-        return {"signal": "NO_DATA", "reason": "Data Gold tidak cukup"}
+        return {"signal": "NO_DATA", "reason": "Data tidak cukup"}
     
     closes = [d["close"] for d in gold_data]
     current_price = closes[-1]
@@ -300,22 +331,21 @@ def analyze_multi_layer() -> Dict[str, Any]:
     current_vol_data = gold_data[-1]["volume"]
     avg_vol = avg_volume(gold_data, 20)
     
-    # 4. ADX Filter
+    # ADX Filter
     if current_adx < Config.ADX_THRESHOLD:
         return {
             "signal": "NO_TRADE",
             "confidence": 0,
-            "reason": f"ADX {current_adx:.1f} < {Config.ADX_THRESHOLD} (sideways)",
+            "reason": f"ADX {current_adx:.1f} di bawah {Config.ADX_THRESHOLD} (sideways)",
             "adx": current_adx,
             "price": current_price,
             "sma200": current_sma,
-            "last_update": freshness["last_update"]
+            "last_update": freshness["last_update"],
+            "symbol_used": symbol_used
         }
     
-    # 5. Base momentum
     momentum_dir = 1 if current_price > closes[-Config.LOOKBACK] else -1
     
-    # 6. Confidence scoring
     confidence_score = 0
     confirmations = []
     warnings = []
@@ -339,13 +369,13 @@ def analyze_multi_layer() -> Dict[str, Any]:
         confidence_score += 1
         confirmations.append(f"Dekat SMA 200 ({sma_distance_pct:.1f}%)")
     
-    # LAYER 4: Multi-Timeframe (with graceful degradation)
+    # LAYER 4: Multi-Timeframe
     if Config.MTF_ENABLED:
         mtf_aligned = True
         mtf_signals = []
         for tf, lb in zip(Config.MTF_TIMEFRAMES, Config.MTF_LOOKBACKS):
             try:
-                tf_data = gold_data if tf == "1d" else fetch_data(Config.SYMBOL, tf, 2, required=False)
+                tf_data = gold_data if tf == "1d" else fetch_data(symbol_used, tf, 2, required=False)
                 if tf_data and len(tf_data) > lb:
                     tf_closes = [d["close"] for d in tf_data]
                     tf_momentum = 1 if tf_closes[-1] > tf_closes[-lb] else -1
@@ -361,7 +391,7 @@ def analyze_multi_layer() -> Dict[str, Any]:
         elif len(mtf_signals) > 0:
             warnings.append(f"MTF mixed: {', '.join(mtf_signals)}")
     
-    # LAYER 5: Correlation (with graceful degradation)
+    # LAYER 5: Correlation
     if Config.CORRELATION_ENABLED:
         try:
             log.info("Fetching correlation data...")
@@ -396,7 +426,6 @@ def analyze_multi_layer() -> Dict[str, Any]:
         elif current_realized_vol > Config.VOL_HIGH_THRESHOLD:
             warnings.append(f"High vol regime ({current_realized_vol:.1%})")
     
-    # Tentukan confidence level
     if confidence_score >= 6:
         confidence = "STRONG"
     elif confidence_score >= 4:
@@ -414,24 +443,25 @@ def analyze_multi_layer() -> Dict[str, Any]:
         "price": current_price,
         "sma200": current_sma,
         "momentum": momentum_dir,
-        "last_update": freshness["last_update"]
+        "last_update": freshness["last_update"],
+        "symbol_used": symbol_used
     }
 
 # ==============================================================================
 # 7. MAIN RUN
 # ==============================================================================
 def run():
-    log.info(f"=== 🚀 TSMOM GOLD v{Config.VERSION} (Production-Ready) ===")
+    log.info(f"=== 🚀 TSMOM GOLD v{Config.VERSION} (Final) ===")
     
     signal_data = analyze_multi_layer()
     
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%d %b %Y %H:%M UTC")
     
-    # Handle SKIP (weekend/data basi)
+    # Handle SKIP
     if signal_data.get("signal") == "SKIP":
         msg = (
-            f"⏸️ <b>TSMOM GOLD v{Config.VERSION} — SKIP</b>\n"
+            f"<b>⏸️ TSMOM GOLD v{Config.VERSION} — SKIP</b>\n"
             f"📅 {date_str}\n"
             f"──────────────────────\n"
             f"<b>Alasan:</b> {signal_data['reason']}\n"
@@ -444,18 +474,22 @@ def run():
     
     # Handle NO_DATA
     if signal_data.get("signal") == "NO_DATA":
-        msg = f"⚠️ <b>TSMOM GOLD v{Config.VERSION}</b>\n{signal_data['reason']}"
+        msg = f"<b>⚠️ TSMOM GOLD v{Config.VERSION}</b>\n{signal_data['reason']}"
         log.info("\n" + msg)
         send_telegram(msg)
         return
     
-    # Handle NO_TRADE (sideways)
+    # Symbol info
+    symbol_used = signal_data.get("symbol_used", Config.FUTURES_GOLD_SYMBOL)
+    symbol_label = "XAU/USD (Spot)" if symbol_used == Config.SPOT_GOLD_SYMBOL else "GC=F (Futures)"
+    
+    # Handle NO_TRADE
     if signal_data.get("signal") == "NO_TRADE":
         last_update = signal_data.get("last_update", now)
         msg = (
-            f"🔍 <b>TSMOM GOLD v{Config.VERSION} — NO TRADE</b>\n"
+            f"<b>🔍 TSMOM GOLD v{Config.VERSION} — NO TRADE</b>\n"
             f"📅 {date_str}\n"
-            f"💰 {Config.SYMBOL}: ${signal_data['price']:.2f}\n"
+            f"💰 {symbol_label}: ${signal_data['price']:.2f}\n"
             f"📊 Data terakhir: {last_update.strftime('%d %b %Y')}\n"
             f"──────────────────────\n"
             f"<b>Status:</b> {signal_data['reason']}\n"
@@ -467,7 +501,7 @@ def run():
         send_telegram(msg)
         return
     
-    # Handle SIGNAL (ada trade opportunity)
+    # Handle SIGNAL
     conf_emoji = {"STRONG": "🟢", "MEDIUM": "🟡", "WEAK": "🟠"}
     conf_text = {"STRONG": "KUAT", "MEDIUM": "SEDANG", "WEAK": "LEMAH"}
     last_update = signal_data.get("last_update", now)
@@ -475,7 +509,7 @@ def run():
     msg = (
         f"{conf_emoji[signal_data['confidence']]} <b>TSMOM GOLD v{Config.VERSION} — MULTI-LAYER</b>\n"
         f"📅 {date_str}\n"
-        f"💰 {Config.SYMBOL}: ${signal_data['price']:.2f}\n"
+        f"💰 {symbol_label}: ${signal_data['price']:.2f}\n"
         f"📊 Data: {last_update.strftime('%d %b %Y')}\n"
         f"──────────────────────\n"
         f"<b>Sinyal:</b> {signal_data['signal']}\n"
@@ -518,4 +552,4 @@ if __name__ == "__main__":
     except Exception as e:
         import traceback
         log.critical(f"FATAL: {e}\n{traceback.format_exc()}")
-        send_telegram(f"🚨 <b>FATAL ERROR v{Config.VERSION}</b>\n<code>{e}</code>")
+        send_telegram(f"<b>🚨 FATAL ERROR v{Config.VERSION}</b>\n<code>{e}</code>")
