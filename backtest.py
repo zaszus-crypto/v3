@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BACKTEST v3.3 — 180 hari + fix MR filter + walk-forward split."""
+"""BACKTEST v3.3 — 180 hari + walk-forward 3 segmen + chunked fetch."""
 import os, sys, math
 os.environ.setdefault("TELEGRAM_TOKEN", "dummy")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "dummy")
@@ -12,7 +12,7 @@ HOLD_MAX_BARS = 32
 SL_MULT, RR   = 1.8, 2.5
 BURN_IN       = 200
 MAX_CONSEC    = M.MAX_CONSEC_LOSS
-RANGE_DAYS    = "180d"          # v3.3: extend ke 180 hari
+RANGE_DAYS    = "180d"
 
 def resample_30m_to_1h(c30):
     out, bucket = [], []
@@ -81,10 +81,6 @@ def stats(rs):
             "tot": sum(r["R"] for r in rs)}
 
 def mr_fixed(c30, c60, adx_val):
-    """
-    MR v3.3: HAPUS H1 EMA200 filter saat ranging regime.
-    Alasan: ADX < 20 sudah jamin ranging, tidak perlu filter H1 trend lagi.
-    """
     closes = [x["close"] for x in c30]
     if len(closes) < 50: return 0
     m = M.sma(closes, 50)
@@ -92,8 +88,7 @@ def mr_fixed(c30, c60, adx_val):
     if sd == 0: return 0
     z = (closes[-1] - m) / sd
     r = M.rsi(closes)
-    # Ketat: hanya ekstrem
-    if z <= -2.2 and r < 30: return +1     # v3.3: naikkan threshold z ke 2.2
+    if z <= -2.2 and r < 30: return +1
     if z >= 2.2 and r > 70: return -1
     return 0
 
@@ -105,10 +100,10 @@ def run_backtest():
     h1_map = build_h1_map(c30_full, c60_full)
     log(f"M30: {len(c30_full)} | H1: {len(c60_full)}")
 
-    # Walk-forward: bagi 3 segmen untuk cek konsistensi
     total_len = len(c30_full)
     segment_size = total_len // 3
     results = []
+    consec_loss = 0
 
     for i in range(BURN_IN, total_len - HOLD_MAX_BARS - 2):
         c30 = c30_full[:i+1]
@@ -118,6 +113,7 @@ def run_backtest():
         if not M.regime_ok(c30): continue
         hh = c30[-1]["time"].hour
         if not M.in_killzone(hh): continue
+        if consec_loss >= MAX_CONSEC: continue
 
         adx_val = M.adx(c30, 14)
         if adx_val >= M.ADX_TREND:
@@ -132,10 +128,11 @@ def run_backtest():
         a = M.atr(c30, 14)
         if a <= 0: continue
         r, h = evaluate(c30_full, i, v, SL_MULT*a, SL_MULT*a*RR)
-        # Segment index: 0, 1, 2
         seg = min(2, i // segment_size)
         results.append({"time": str(c30[-1]["time"]), "dir": v, "R": r,
                         "hasil": h, "regime": regime, "seg": seg})
+        if r > 0: consec_loss = 0
+        else: consec_loss += 1
 
     n = len(results)
     log(f"Total sinyal: {n} (dari {total_len} candle, {RANGE_DAYS})")
@@ -149,7 +146,7 @@ def run_backtest():
 
     def line(name, s):
         if s is None: return f"  {name:20s}: n=0"
-        pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "∞"
+        pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "inf"
         return (f"  {name:20s}: n={s['n']:3d} WR={s['wr']:5.1f}% "
                 f"PF={pf_s:>5s} Exp={s['exp']:+.3f}R DD={s['mdd']:.1f}R")
 
@@ -162,7 +159,6 @@ def run_backtest():
     log(line("Trending MSB", msb_s))
     log(line("Ranging MR", mr_s))
 
-    # Verdict: butuh n>=30 dan PF>=1.5 di MINIMAL 2 dari 3 segmen
     consistent = sum(1 for s in seg_stats if s and s["pf"] >= 1.4) >= 2
     verdict_ok = (overall["n"] >= 30 and overall["pf"] >= 1.5
                   and overall["exp"] > 0.25 and overall["mdd"] < 30
@@ -170,7 +166,7 @@ def run_backtest():
 
     lines = [f"<b>📋 BACKTEST v3.3 — {RANGE_DAYS}</b>", "──────────────────"]
     if overall:
-        pf_s = f"{overall['pf']:.2f}" if overall['pf'] != float('inf') else "∞"
+        pf_s = f"{overall['pf']:.2f}" if overall['pf'] != float('inf') else "inf"
         lines += [f"Total sinyal    : {overall['n']}",
                   f"🏆 Win rate     : {overall['wr']:.1f}%",
                   f"💵 Profit factor: {pf_s}",
@@ -181,23 +177,23 @@ def run_backtest():
     for k in range(3):
         s = seg_stats[k]
         if s:
-            pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "∞"
+            pf_s = f"{s['pf']:.2f}" if s['pf'] != float('inf') else "inf"
             lines.append(f"• S{k+1}: n={s['n']} PF={pf_s} Exp={s['exp']:+.2f}R")
         else:
             lines.append(f"• S{k+1}: n=0")
     lines.append("──────────────────")
     lines.append("<b>Per regime:</b>")
     if msb_s:
-        pf_s = f"{msb_s['pf']:.2f}" if msb_s['pf'] != float('inf') else "∞"
+        pf_s = f"{msb_s['pf']:.2f}" if msb_s['pf'] != float('inf') else "inf"
         lines.append(f"• Trend MSB: n={msb_s['n']} PF={pf_s} Exp={msb_s['exp']:+.2f}R")
     if mr_s:
-        pf_s = f"{mr_s['pf']:.2f}" if mr_s['pf'] != float('inf') else "∞"
+        pf_s = f"{mr_s['pf']:.2f}" if mr_s['pf'] != float('inf') else "inf"
         lines.append(f"• Range MR : n={mr_s['n']} PF={pf_s} Exp={mr_s['exp']:+.2f}R")
     lines.append("──────────────────")
-    lines.append(f"<b>Konsistensi antar segmen: "
-                 f"{sum(1 for s in seg_stats if s and s['pf'] >= 1.4)}/3</b>")
+    lines.append(f"<b>Konsistensi: "
+                 f"{sum(1 for s in seg_stats if s and s['pf'] >= 1.4)}/3 segmen PF>=1.4</b>")
     lines.append("✅ LAYAK forward test" if verdict_ok
-                 else "⚠️ BELUM — butuh n≥30 + PF≥1.5 di ≥2 segmen")
+                 else "⚠️ BELUM — butuh n>=30 + PF>=1.5 di >=2 segmen")
 
     msg = "\n".join(lines)
     log("\n" + msg.replace("<b>","").replace("</b>",""))
