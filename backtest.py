@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TURTLE × ORB CONFLUENCE v10.0 — FINAL
-Fondasi: Turtle Breakout (PF 1.22, n=831) + filter kualitas.
-Target: PF ≥ 1.40 dengan n ≥ 150.
+TSMOM GOLD v12.0 — Time-Series Momentum institutional.
+Basis: Moskowitz-Ooi-Pedersen (2012). State-machine fixed.
 """
 import os, sys, math, time, random, requests
 os.environ.setdefault("TELEGRAM_TOKEN", "dummy")
@@ -12,63 +11,53 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main as M
 from datetime import datetime, timezone, timedelta
 
-# PARAMETER FINAL
-DONCHIAN_N   = 20
-EMA_FAST     = 50
-EMA_SLOW     = 200
-ATR_P        = 14
-SL_ATR       = 2.0
-RR_TARGET    = 1.5
-HOLD_HOURS   = 48
-BODY_MIN     = 0.55
-ATR_SPIKE    = 2.5
-SESSION_START = 7
-SESSION_END   = 19
-COOLDOWN_H    = 18
+LOOKBACK   = 252
+REBALANCE  = 5
+ATR_P      = 20
+INIT_RISK  = 2.0
+TRAIL_MULT = 4.0
+TARGET_VOL = 0.15
+VOL_WINDOW = 20
+SIZE_MIN   = 0.3
+SIZE_MAX   = 3.0
+MAX_HOLD   = 500
 
-def fetch(symbol="GC=F", rng="2y"):
+def fetch_daily(years=10):
     for host in ("query1","query2"):
-        url = (f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}"
-               f"?interval=1h&range={rng}")
+        url=(f"https://{host}.finance.yahoo.com/v8/finance/chart/GC=F"
+             f"?interval=1d&range={years}y")
         for a in range(3):
             try:
-                r = requests.get(url, headers=M.HEADERS, timeout=30)
-                if r.status_code == 429:
+                r=requests.get(url,headers=M.HEADERS,timeout=30)
+                if r.status_code==429:
                     time.sleep((2**a)+random.uniform(0,1)); continue
                 r.raise_for_status()
                 return _p(r.json())
             except Exception:
                 time.sleep((2**a)+random.uniform(0,1))
-    raise RuntimeError(f"{symbol} fail")
+    raise RuntimeError("Yahoo fail")
 
 def _p(data):
-    d = data["chart"]["result"][0]
-    ts = d.get("timestamp") or []
-    q = d["indicators"]["quote"][0]
-    now = datetime.now(timezone.utc)
-    out = []
+    d=data["chart"]["result"][0]
+    ts=d.get("timestamp") or []
+    q=d["indicators"]["quote"][0]
+    now=datetime.now(timezone.utc)
+    out=[]
     for i,t in enumerate(ts):
-        try: o,h,l,c = q["open"][i],q["high"][i],q["low"][i],q["close"][i]
+        try: o,h,l,c=q["open"][i],q["high"][i],q["low"][i],q["close"][i]
         except (KeyError, IndexError): continue
         if None in (o,h,l,c) or h<l or o<=0 or c<=0: continue
-        dt = datetime.fromtimestamp(t, timezone.utc)
-        if (dt + timedelta(hours=1)) > now: continue
+        dt=datetime.fromtimestamp(t,timezone.utc)
+        if (dt+timedelta(days=1))>now: continue
         out.append({"time":dt,"open":float(o),"high":float(h),
                     "low":float(l),"close":float(c)})
     return out
-
-def ema(v,n):
-    if not v: return 0.0
-    if len(v)<n: return sum(v)/len(v)
-    k=2/(n+1); e=v[-n]
-    for x in v[-n+1:]: e=x*k+e*(1-k)
-    return e
 
 def sma(v,n):
     if not v: return 0.0
     n=min(n,len(v)); return sum(v[-n:])/n
 
-def atr(c,n=14):
+def atr(c,n=20):
     if len(c)<2: return 0.0
     t=[]
     for i in range(1,len(c)):
@@ -76,27 +65,16 @@ def atr(c,n=14):
         t.append(max(h-l,abs(h-pc),abs(l-pc)))
     return sma(t,n)
 
-def donchian(c,n=20):
-    if len(c)<n+1: return None,None
-    w=c[-n-1:-1]
-    return max(x["high"] for x in w), min(x["low"] for x in w)
-
-def sim(c,i,d,entry,sl,tp,dist):
-    end=min(i+1+HOLD_HOURS,len(c))
-    for j in range(i+1,end):
-        h,l=c[j]["high"],c[j]["low"]
-        if d==1:
-            if l<=sl: return -1.0,"SL"
-            if h>=tp: return RR_TARGET,"TP"
-        else:
-            if h>=sl: return -1.0,"SL"
-            if l<=tp: return RR_TARGET,"TP"
-    ex=c[end-1]["close"]
-    return (ex-entry)/dist*d,"TIMEOUT"
+def realized_vol(closes,w=20):
+    if len(closes)<w+1: return 0.20
+    rets=[(closes[i]-closes[i-1])/closes[i-1] for i in range(-w,0)]
+    m=sum(rets)/w
+    sd=math.sqrt(sum((x-m)**2 for x in rets)/w)
+    return sd*math.sqrt(252)
 
 def stats(rs):
     n=len(rs)
-    if not n: return None
+    if n==0: return None
     w=[r for r in rs if r["R"]>0]; l=[r for r in rs if r["R"]<=0]
     gw=sum(r["R"] for r in w); gl=abs(sum(r["R"] for r in l))
     pf=gw/gl if gl>0 else float('inf')
@@ -104,74 +82,86 @@ def stats(rs):
     for r in rs:
         eq+=r["R"]; peak=max(peak,eq); mdd=max(mdd,peak-eq)
     return {"n":n,"wr":len(w)/n*100,"pf":pf,
-            "exp":sum(r["R"] for r in rs)/n,"mdd":mdd}
+            "exp":sum(r["R"] for r in rs)/n,"mdd":mdd,
+            "tot":sum(r["R"] for r in rs)}
 
 def run():
     log=M.log
-    log("=== TURTLE × ORB CONFLUENCE v10.0 ===")
-    c=fetch("GC=F","2y")
-    log(f"Data: {len(c)} candle H1")
-    if len(c)<500: M.send_telegram("Data kurang"); return
+    log("=== TSMOM GOLD v12.0 ===")
+    c=fetch_daily(10)
+    log(f"Daily: {len(c)} ({len(c)/252:.1f} tahun)")
+    if len(c)<400:
+        M.send_telegram("Data kurang"); return
 
-    results=[]; last=-999
-    rea={"burn":0,"donchian":0,"trend":0,"body":0,"atr":0,
-         "session":0,"cooldown":0,"signal":0}
+    closes=[x["close"] for x in c]
+    results=[]
+    pos=0; entry_price=0.0; entry_idx=0
+    peak_price=0.0; init_risk=0.0; trail_dist=0.0; vol_size=1.0
+    last_rebal=-REBALANCE
 
-    for i in range(EMA_SLOW+10, len(c)-HOLD_HOURS-1):
-        cs=c[:i+1]
-        closes=[x["close"] for x in cs]
-        last_c=cs[-1]; prev=cs[-2]
-        dc_up, dc_lo = donchian(cs, DONCHIAN_N)
-        if dc_up is None: rea["donchian"]+=1; continue
-        e50=ema(closes,EMA_FAST); e200=ema(closes,EMA_SLOW)
-        a=atr(cs,ATR_P)
+    for i in range(LOOKBACK+30, len(c)):
+        a=atr(c[:i+1], ATR_P)
         if a<=0: continue
 
-        # Trend filter
-        if last_c["close"]>dc_up and last_c["close"]>e50 and e50>e200:
-            d=+1
-        elif last_c["close"]<dc_lo and last_c["close"]<e50 and e50<e200:
-            d=-1
-        else:
-            rea["trend"]+=1; continue
+        # 1. Trailing / exit
+        if pos != 0:
+            hold=i-entry_idx
+            exited=False
+            if pos==1:
+                peak_price=max(peak_price, c[i]["high"])
+                sl_now=max(entry_price-init_risk, peak_price-trail_dist)
+                if c[i]["low"] <= sl_now:
+                    r=(sl_now-entry_price)/init_risk*vol_size
+                    results.append({"time":str(c[i]["time"]),"dir":pos,"R":r,
+                                    "idx":entry_idx,"hold":hold})
+                    pos=0; exited=True
+            else:
+                peak_price=min(peak_price, c[i]["low"])
+                sl_now=min(entry_price+init_risk, peak_price+trail_dist)
+                if c[i]["high"] >= sl_now:
+                    r=(entry_price-sl_now)/init_risk*vol_size
+                    results.append({"time":str(c[i]["time"]),"dir":pos,"R":r,
+                                    "idx":entry_idx,"hold":hold})
+                    pos=0; exited=True
+            if not exited and hold>=MAX_HOLD:
+                r=(c[i]["close"]-entry_price)/init_risk*vol_size if pos==1 else \
+                  (entry_price-c[i]["close"])/init_risk*vol_size
+                results.append({"time":str(c[i]["time"]),"dir":pos,"R":r,
+                                "idx":entry_idx,"hold":hold})
+                pos=0
 
-        # ATR spike filter
-        atr_series=[atr(cs[:k+1],ATR_P) for k in range(max(0,len(cs)-20),len(cs))]
-        a_avg=sma(atr_series,20)
-        if a>a_avg*ATR_SPIKE: rea["atr"]+=1; continue
+        # 2. TSMOM signal (weekly rebalance)
+        if (i-last_rebal) < REBALANCE: continue
+        last_rebal=i
 
-        # Body filter
-        body=abs(last_c["close"]-last_c["open"])
-        rng=last_c["high"]-last_c["low"]
-        body_pct=body/rng if rng>0 else 0
-        if body_pct<BODY_MIN: rea["body"]+=1; continue
+        past=closes[i-LOOKBACK]; curr=closes[i]
+        new_dir = +1 if curr>past else -1
+        if new_dir==pos: continue
 
-        # Session
-        hh=last_c["time"].hour
-        if not (SESSION_START<=hh<SESSION_END): rea["session"]+=1; continue
+        # Close posisi lama kalau ada
+        if pos!=0:
+            r=(curr-entry_price)/init_risk*vol_size if pos==1 else \
+              (entry_price-curr)/init_risk*vol_size
+            results.append({"time":str(c[i]["time"]),"dir":pos,"R":r,
+                            "idx":entry_idx,"hold":i-entry_idx})
 
-        # Cooldown
-        if (i-last)<COOLDOWN_H: rea["cooldown"]+=1; continue
-
-        entry=c[i+1]["open"]
-        sl_dist=a*SL_ATR
-        if d==1: sl=entry-sl_dist; tp=entry+sl_dist*RR_TARGET
-        else: sl=entry+sl_dist; tp=entry-sl_dist*RR_TARGET
-
-        r,h=sim(c,i,d,entry,sl,tp,sl_dist)
-        results.append({"time":str(last_c["time"]),"dir":d,"R":r,
-                        "hasil":h,"idx":i})
-        rea["signal"]+=1; last=i
+        # Buka posisi baru
+        vol=realized_vol(closes[:i+1], VOL_WINDOW)
+        if vol<=0: continue
+        vol_size=max(SIZE_MIN, min(SIZE_MAX, TARGET_VOL/vol))
+        pos=new_dir; entry_price=curr; entry_idx=i
+        init_risk=a*INIT_RISK; trail_dist=a*TRAIL_MULT
+        peak_price=c[i]["high"] if pos==1 else c[i]["low"]
 
     n=len(results)
-    log(f"Sinyal: {n} | {rea}")
-    if not n:
-        M.send_telegram("<b>Turtle×ORB v10.0</b>: 0 sinyal"); return
+    log(f"Total trades: {n}")
+    if n==0:
+        M.send_telegram("<b>TSMOM v12.0</b>: 0 trade"); return
 
-    total=len(c); third=total//3
+    total=len(c); fourth=total//4
     segs=[]
-    for k in range(3):
-        lo,hi=k*third,(k+1)*third
+    for k in range(4):
+        lo,hi=k*fourth,(k+1)*fourth
         segs.append(stats([r for r in results if lo<=r["idx"]<hi]))
     ov=stats(results)
 
@@ -182,27 +172,32 @@ def run():
                 f"PF={pf_s:>5s} Exp={s['exp']:+.3f}R DD={s['mdd']:.1f}R")
 
     log("\n--- OVERALL ---"); log(L("TOTAL",ov))
-    log("\n--- SEGMEN ---")
-    for k in range(3): log(L(f"S{k+1}",segs[k]))
+    log("\n--- 4 SEGMEN ---")
+    for k in range(4): log(L(f"S{k+1}",segs[k]))
+
+    holds=[r["hold"] for r in results]
+    avg_hold=sum(holds)/len(holds) if holds else 0
+    log(f"Avg hold: {avg_hold:.1f} hari")
 
     cons=sum(1 for s in segs if s and s["pf"]>=1.3)
-    ok = ov["n"]>=100 and ov["pf"]>=1.40 and ov["exp"]>0.2 and cons>=2
+    ok = ov["n"]>=20 and ov["pf"]>=1.4 and ov["exp"]>0.3 and cons>=3
 
-    msg=(f"<b>📋 TURTLE × ORB CONFLUENCE v10.0</b>\n"
+    msg=(f"<b>📋 TSMOM GOLD v12.0</b>\n"
          f"──────────────────\n"
-         f"Total sinyal  : {ov['n']}\n"
+         f"Total trades  : {ov['n']}\n"
          f"🏆 Win rate   : {ov['wr']:.1f}%\n"
          f"💵 PF         : {ov['pf']:.2f}\n"
          f"📈 Expectancy : {ov['exp']:+.3f} R\n"
          f"📉 Max DD     : {ov['mdd']:.1f} R\n"
+         f"⏱ Avg hold    : {avg_hold:.0f} hari\n"
          f"──────────────────\n"
          f"<b>Walk-forward:</b>\n")
-    for k in range(3):
+    for k in range(4):
         s=segs[k]
         if s:
             pf_s=f"{s['pf']:.2f}" if s['pf']!=float('inf') else "inf"
             msg+=f"• S{k+1}: n={s['n']} WR={s['wr']:.0f}% PF={pf_s} Exp={s['exp']:+.2f}R\n"
-    msg+=f"──────────────────\nKonsistensi: {cons}/3\n"
+    msg+=f"──────────────────\nKonsistensi: {cons}/4\n"
     msg+="✅ LAYAK LIVE" if ok else "⚠️ BELUM"
     log("\n"+msg.replace("<b>","").replace("</b>",""))
     M.send_telegram(msg)
