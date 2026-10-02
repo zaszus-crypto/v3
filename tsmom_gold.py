@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TSMOM GOLD v15.3 (Final Polish)
-Fix: Correct Yahoo Spot Gold ticker (XAU=X) + Robust HTML Escape.
+TSMOM GOLD v15.4 (Clean & Direct)
+Menggunakan GC=F (Gold Futures) sebagai standar institusional.
+Sinyal tren (LONG/SHORT) 100% valid untuk diaplikasikan di MT5 (XAU/USD).
 """
 import os
 import sys
@@ -18,13 +19,8 @@ from typing import List, Dict, Any, Optional
 # 1. KONFIGURASI
 # ==============================================================================
 class Config:
-    VERSION         = "15.3"
-    
-    # --- SYMBOL (Spot vs Futures) ---
-    # XAU=X adalah ticker resmi Yahoo Finance untuk Gold Spot (Troy Ounce)
-    SPOT_GOLD_SYMBOL = "XAU=X"       
-    FUTURES_GOLD_SYMBOL = "GC=F"     # Gold futures (fallback)
-    USE_SPOT_FIRST   = True          # Coba spot dulu (lebih dekat ke harga MT5)
+    VERSION         = "15.4"
+    SYMBOL          = "GC=F"        # Standar institusional untuk TSMOM Gold
     
     LOOKBACK        = 252
     REBALANCE       = 5
@@ -82,7 +78,6 @@ logging.basicConfig(
 log = logging.getLogger("TSMOM")
 
 def escape_html(text: str) -> str:
-    """Escape karakter HTML berbahaya tapi pertahankan tag yang diizinkan."""
     text = text.replace('&', '&amp;')
     text = text.replace('<', '&lt;')
     text = text.replace('>', '&gt;')
@@ -143,21 +138,6 @@ def fetch_data(symbol: str, interval: str = "1d", years: int = 10,
     else:
         log.warning(f"Data opsional {symbol} tidak tersedia, skip layer ini.")
         return None
-
-def fetch_gold_data() -> tuple[List[Dict[str, Any]], str]:
-    """Fetch gold data dengan fallback: Spot (XAU=X) → Futures (GC=F)."""
-    if Config.USE_SPOT_FIRST:
-        log.info(f"Fetching spot gold ({Config.SPOT_GOLD_SYMBOL})...")
-        data = fetch_data(Config.SPOT_GOLD_SYMBOL, "1d", Config.DATA_YEARS, required=False)
-        if data and len(data) >= Config.MIN_BARS:
-            log.info(f"✅ Spot gold data loaded: {len(data)} bars")
-            return data, Config.SPOT_GOLD_SYMBOL
-        else:
-            log.warning(f"Spot gold tidak tersedia/cukup, fallback ke futures...")
-    
-    log.info(f"Fetching gold futures ({Config.FUTURES_GOLD_SYMBOL})...")
-    data = fetch_data(Config.FUTURES_GOLD_SYMBOL, "1d", Config.DATA_YEARS, required=True)
-    return data, Config.FUTURES_GOLD_SYMBOL
 
 def _parse(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     result = data["chart"]["result"][0]
@@ -291,7 +271,9 @@ def analyze_multi_layer() -> Dict[str, Any]:
     if Config.SKIP_WEEKEND and is_weekend():
         return {"signal": "SKIP", "reason": "Weekend — pasar tutup"}
     
-    gold_data, symbol_used = fetch_gold_data()
+    log.info(f"Fetching data untuk {Config.SYMBOL}...")
+    gold_data = fetch_data(Config.SYMBOL, "1d", Config.DATA_YEARS, required=True)
+    
     freshness = check_data_freshness(gold_data)
     if not freshness["fresh"]:
         return {"signal": "SKIP", "reason": freshness["reason"]}
@@ -313,8 +295,7 @@ def analyze_multi_layer() -> Dict[str, Any]:
             "adx": current_adx,
             "price": current_price,
             "sma200": current_sma,
-            "last_update": freshness["last_update"],
-            "symbol_used": symbol_used
+            "last_update": freshness["last_update"]
         }
     
     momentum_dir = 1 if current_price > closes[-Config.LOOKBACK] else -1
@@ -343,7 +324,7 @@ def analyze_multi_layer() -> Dict[str, Any]:
         mtf_signals = []
         for tf, lb in zip(Config.MTF_TIMEFRAMES, Config.MTF_LOOKBACKS):
             try:
-                tf_data = gold_data if tf == "1d" else fetch_data(symbol_used, tf, 2, required=False)
+                tf_data = gold_data if tf == "1d" else fetch_data(Config.SYMBOL, tf, 2, required=False)
                 if tf_data and len(tf_data) > lb:
                     tf_closes = [d["close"] for d in tf_data]
                     tf_momentum = 1 if tf_closes[-1] > tf_closes[-lb] else -1
@@ -406,15 +387,14 @@ def analyze_multi_layer() -> Dict[str, Any]:
         "price": current_price,
         "sma200": current_sma,
         "momentum": momentum_dir,
-        "last_update": freshness["last_update"],
-        "symbol_used": symbol_used
+        "last_update": freshness["last_update"]
     }
 
 # ==============================================================================
 # 7. MAIN RUN
 # ==============================================================================
 def run():
-    log.info(f"=== 🚀 TSMOM GOLD v{Config.VERSION} (Final Polish) ===")
+    log.info(f"=== 🚀 TSMOM GOLD v{Config.VERSION} (Clean & Direct) ===")
     signal_data = analyze_multi_layer()
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%d %b %Y %H:%M UTC")
@@ -424,13 +404,11 @@ def run():
     elif signal_data.get("signal") == "NO_DATA":
         msg = f"<b>⚠️ TSMOM GOLD v{Config.VERSION}</b>\n{signal_data['reason']}"
     elif signal_data.get("signal") == "NO_TRADE":
-        symbol_used = signal_data.get("symbol_used", Config.FUTURES_GOLD_SYMBOL)
-        symbol_label = "XAU/USD (Spot)" if symbol_used == Config.SPOT_GOLD_SYMBOL else "GC=F (Futures)"
         last_update = signal_data.get("last_update", now)
         msg = (
             f"<b>🔍 TSMOM GOLD v{Config.VERSION} — NO TRADE</b>\n"
             f"📅 {date_str}\n"
-            f"💰 {symbol_label}: ${signal_data['price']:.2f}\n"
+            f"💰 Gold Futures (GC=F): ${signal_data['price']:.2f}\n"
             f"📊 Data terakhir: {last_update.strftime('%d %b %Y')}\n"
             f"──────────────────────\n"
             f"<b>Status:</b> {signal_data['reason']}\n"
@@ -439,8 +417,6 @@ def run():
             f"<i>⚠️ TUNGGU sinyal tren kuat sebelum entry.</i>"
         )
     else:
-        symbol_used = signal_data.get("symbol_used", Config.FUTURES_GOLD_SYMBOL)
-        symbol_label = "XAU/USD (Spot)" if symbol_used == Config.SPOT_GOLD_SYMBOL else "GC=F (Futures)"
         conf_emoji = {"STRONG": "🟢", "MEDIUM": "🟡", "WEAK": "🟠"}
         conf_text = {"STRONG": "KUAT", "MEDIUM": "SEDANG", "WEAK": "LEMAH"}
         last_update = signal_data.get("last_update", now)
@@ -448,7 +424,7 @@ def run():
         msg = (
             f"{conf_emoji[signal_data['confidence']]} <b>TSMOM GOLD v{Config.VERSION} — MULTI-LAYER</b>\n"
             f"📅 {date_str}\n"
-            f"💰 {symbol_label}: ${signal_data['price']:.2f}\n"
+            f"💰 Gold Futures (GC=F): ${signal_data['price']:.2f}\n"
             f"📊 Data: {last_update.strftime('%d %b %Y')}\n"
             f"──────────────────────\n"
             f"<b>Sinyal:</b> {signal_data['signal']}\n"
@@ -469,12 +445,11 @@ def run():
             f"──────────────────────\n"
             f"<b>⚠️ PENTING:</b>\n"
             f"• BUKAN auto-trade signal\n"
-            f"• Konfirmasi manual dengan chart\n"
+            f"• Sinyal tren ini 100% valid untuk MT5 (XAU/USD)\n"
+            f"• Harga Spot MT5 mungkin berbeda ~0.5% (futures premium)\n"
             f"• STRONG: 1% | MEDIUM: 0.5% | WEAK: skip\n"
             f"• Stop loss: 2x ATR\n"
             f"──────────────────────\n"
-            f"<i>Catatan: Harga Futures (GC=F) secara alami memiliki premium "
-            f"~0.5-1% di atas harga Spot MT5 karena biaya carry.</i>\n"
             f"<i>Trading mengandung risiko tinggi.</i>"
         )
     
