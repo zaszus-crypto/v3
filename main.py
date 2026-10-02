@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD GOLD SIGNAL BOT — v3.2 STRICT
+XAUUSD GOLD SIGNAL BOT — v3.3 FINAL
 ================================================================
-Berdasarkan backtest v3.1:
-  • PF 1.34, tapi DD 68.4R (fatal) → sinyal terlalu banyak
-  • MSB n=506 (97% dominan) → filter terlalu longgar
-  • MR n=13, PF 2.92 → kualitas bagus, frekuensi wajar
+Regime-switching bot:
+  • ADX >= 30 (TRENDING)  → MSB_Strict (hanya prime hours 12-17 UTC)
+  • ADX <= 20 (RANGING)   → MeanReversion (z-score ekstrem)
+  • 20 < ADX < 30         → SKIP (zona transisi)
 
-Perbaikan v3.2:
-  1. MSB diperketat: H1 EMA50 vs EMA200 + M30 EMA stack + slope
-  2. MSB hanya prime hours (12-17 UTC overlap London-NY)
-  3. ADX_TREND 25 → 30
-  4. Equity curve filter: stop entry setelah 4 loss beruntun
+Fitur:
+  • Chunked fetch (Yahoo) untuk range > 60d
+  • Auto spot-offset calibration (bootstrap-aware)
+  • Equity curve filter (stop setelah 4 loss beruntun)
+  • Anti-spam cooldown 90 menit
+  • Anti-geoblock (query1 → query2 fallback)
 """
 import os, json, time, math, random, pickle, requests
 from datetime import datetime, timezone, timedelta
@@ -30,22 +31,23 @@ os.makedirs(STATE_DIR, exist_ok=True)
 
 # Sesi (UTC)
 KILLZONES     = [(0, 5), (6, 12), (12, 17)]
-PRIME_HOURS   = set(range(12, 17))    # overlap London-NY
-MSB_HOURS     = PRIME_HOURS            # MSB hanya di prime hours
+PRIME_HOURS   = set(range(12, 17))
+MSB_HOURS     = PRIME_HOURS
 
-# Regime thresholds (v3.2: ADX_TREND naik ke 30)
+# Regime thresholds
 ADX_TREND = 30
 ADX_RANGE = 20
 
 # Risk
 SL_MULT    = 1.8
 RR_TARGET  = 2.5
+ATR_PERIOD = 14
 
 # Anti-spam
 COOLDOWN_MIN = 90
 
 # Equity curve filter
-MAX_CONSEC_LOSS = 4          # stop entry setelah N loss beruntun
+MAX_CONSEC_LOSS = 4
 
 # Spot verification
 SPOT_OFFSET_DEFAULT = 15.0
@@ -114,8 +116,20 @@ def _spans_weekend(t1, t2):
         d += timedelta(days=1)
     return False
 
-# ========================== DATA ==========================
+# ========================== DATA (chunked fetch) ==========================
 _INTERVAL_MIN = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}
+_INTERVAL_MAX_DAYS = {"5m": 60, "15m": 60, "30m": 60, "1h": 730}
+
+def _parse_range_days(rng):
+    rng = rng.strip().lower()
+    try:
+        if rng.endswith("mo"): return int(rng[:-2]) * 30
+        if rng.endswith("d"):  return int(rng[:-1])
+        if rng.endswith("y"):  return int(rng[:-1]) * 365
+        if rng.endswith("h"):  return max(1, int(rng[:-1]) // 24)
+    except Exception:
+        pass
+    return 60
 
 def _yahoo_chart(symbol, interval, rng, host="query1"):
     url = (f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -135,41 +149,107 @@ def _yahoo_chart(symbol, interval, rng, host="query1"):
             time.sleep((2 ** attempt) + random.uniform(0, 1))
     raise RuntimeError(f"Yahoo fetch gagal: {last_err}")
 
-def fetch_ohlc(interval="30m", rng="5d", drop_incomplete=True):
-    data = None
-    for host in ("query1", "query2"):
+def _yahoo_chart_period(symbol, interval, p1, p2, host="query1"):
+    url = (f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}"
+           f"?interval={interval}&period1={p1}&period2={p2}")
+    last_err = None
+    for attempt in range(4):
         try:
-            data = _yahoo_chart("GC=F", interval, rng, host=host)
-            break
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            if r.status_code == 429:
+                wait = (2 ** attempt) + random.uniform(0, 1.5)
+                log(f"Yahoo 429 ({host}), tunggu {wait:.1f}s")
+                time.sleep(wait); continue
+            r.raise_for_status()
+            return r.json()
         except Exception as e:
-            log(f"Host {host} gagal: {e}")
-    if data is None:
-        raise RuntimeError("Semua host Yahoo gagal")
+            last_err = e
+            time.sleep((2 ** attempt) + random.uniform(0, 1))
+    raise RuntimeError(f"Yahoo fetch gagal: {last_err}")
 
-    d = data["chart"]["result"][0]
+def _parse_candles(data, interval, drop_incomplete):
+    try:
+        results = data.get("chart", {}).get("result") or []
+        if not results: return []
+        d = results[0]
+    except Exception:
+        return []
     ts = d.get("timestamp") or []
-    q = d["indicators"]["quote"][0]
-    vols = (d["indicators"].get("quote") or [{}])[0].get("volume") or [0]*len(ts)
+    q = (d.get("indicators", {}).get("quote") or [{}])[0]
+    vols = q.get("volume") or [0]*len(ts)
     step_min = _INTERVAL_MIN.get(interval, 30)
     now = datetime.now(timezone.utc)
-
-    candles, seen = [], set()
+    candles = []
     for i, t in enumerate(ts):
-        o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+        try:
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+        except (KeyError, IndexError):
+            continue
         if None in (o, h, l, c): continue
         if h < l or o <= 0 or c <= 0 or h <= 0 or l <= 0: continue
         if h < max(o, c) or l > min(o, c): continue
         dt = datetime.fromtimestamp(t, timezone.utc)
-        if dt in seen: continue
-        seen.add(dt)
         if drop_incomplete and (dt + timedelta(minutes=step_min)) > now:
             continue
         v = vols[i] if i < len(vols) and vols[i] is not None else 0
         candles.append({"time": dt, "open": float(o), "high": float(h),
                         "low": float(l), "close": float(c), "vol": float(v)})
+    return candles
+
+def fetch_ohlc(interval="30m", rng="5d", drop_incomplete=True):
+    range_days = _parse_range_days(rng)
+    max_days   = _INTERVAL_MAX_DAYS.get(interval, 60)
+
+    if range_days <= max_days:
+        data = None
+        for host in ("query1", "query2"):
+            try:
+                data = _yahoo_chart("GC=F", interval, rng, host=host)
+                break
+            except Exception as e:
+                log(f"Host {host} gagal: {e}")
+        if data is None:
+            raise RuntimeError("Semua host Yahoo gagal")
+        candles = _parse_candles(data, interval, drop_incomplete)
+    else:
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        windows = []
+        end_ts = now_ts
+        remaining = range_days
+        while remaining > 0:
+            win_days = min(max_days, remaining)
+            start_ts = end_ts - win_days * 86400
+            windows.append((start_ts, end_ts))
+            end_ts = start_ts
+            remaining -= win_days
+        windows.reverse()
+        log(f"Fetch {interval} {rng}: {len(windows)} chunk @ {max_days}d")
+        all_candles = []
+        for idx, (p1, p2) in enumerate(windows, 1):
+            data = None
+            for host in ("query1", "query2"):
+                try:
+                    data = _yahoo_chart_period("GC=F", interval, p1, p2, host=host)
+                    break
+                except Exception as e:
+                    log(f"Chunk {idx} host {host} gagal: {e}")
+            if data is None:
+                log(f"Chunk {idx} gagal total"); continue
+            chunk = _parse_candles(data, interval, drop_incomplete)
+            log(f"  Chunk {idx}: {len(chunk)} candle")
+            all_candles.extend(chunk)
+            time.sleep(0.6)
+        seen = set(); candles = []
+        for c in all_candles:
+            if c["time"] in seen: continue
+            seen.add(c["time"]); candles.append(c)
+        candles.sort(key=lambda x: x["time"])
+        log(f"Total setelah dedupe: {len(candles)} candle")
+
     if len(candles) < 55:
         raise ValueError(f"Data {interval} terlalu sedikit: {len(candles)}")
 
+    step_min = _INTERVAL_MIN.get(interval, 30)
     for i in range(1, len(candles)):
         gap_min = (candles[i]["time"] - candles[i-1]["time"]).total_seconds()/60
         if gap_min <= step_min * 4: continue
@@ -264,42 +344,29 @@ def swing_points(candles, lb=5):
             lows.append(l)
     return highs[-3:], lows[-3:]
 
-# ========================== STRATEGI (v3.2) ==========================
+# ========================== STRATEGI ==========================
 def strat_msb_strict(c30, c60):
-    """
-    MSB v3.2 — stricter:
-      H1 bias: EMA50 vs EMA200
-      M30 trigger: EMA20 vs EMA50 stack + slope + price position
-      Quality >= 3 dari 3 kondisi
-    """
     if len(c30) < 55 or len(c60) < 60: return 0
     closes30 = [x["close"] for x in c30]
     closes60 = [x["close"] for x in c60]
-
-    # H1 bias
     e50_60  = ema(closes60, 50)
     e200_60 = ema(closes60, min(200, len(closes60)))
     if e50_60 > e200_60:   bias = +1
     elif e50_60 < e200_60: bias = -1
     else: return 0
-
-    # M30 stack
     e20_30 = ema(closes30, 20)
     e50_30 = ema(closes30, 50)
     e20_30_prev = ema(closes30[:-5], 20)
-
-    # Quality score (0-3)
     q = 0
     if bias == 1:
-        if e20_30 > e50_30:                q += 1   # stack aligned
-        if closes30[-1] > e20_30:          q += 1   # price above EMA20
-        if e20_30 > e20_30_prev:           q += 1   # EMA20 rising
+        if e20_30 > e50_30:       q += 1
+        if closes30[-1] > e20_30: q += 1
+        if e20_30 > e20_30_prev:  q += 1
     else:
-        if e20_30 < e50_30:                q += 1
-        if closes30[-1] < e20_30:          q += 1
-        if e20_30 < e20_30_prev:           q += 1
-
-    return bias if q >= 3 else 0                    # SEMUA kondisi harus terpenuhi
+        if e20_30 < e50_30:       q += 1
+        if closes30[-1] < e20_30: q += 1
+        if e20_30 < e20_30_prev:  q += 1
+    return bias if q >= 3 else 0
 
 def strat_mean_reversion(c, c60=None):
     closes = [x["close"] for x in c]
@@ -309,13 +376,8 @@ def strat_mean_reversion(c, c60=None):
     if sd == 0: return 0
     z = (closes[-1] - m)/sd
     r = rsi(closes)
-    trend_up = trend_down = False
-    if c60 and len(c60) >= 60:
-        e200 = ema([x["close"] for x in c60], min(200, len(c60)))
-        trend_up = c60[-1]["close"] > e200
-        trend_down = c60[-1]["close"] < e200
-    if z <= -2.0 and r < 35 and not trend_down: return +1
-    if z >= 2.0 and r > 65 and not trend_up: return -1
+    if z <= -2.2 and r < 30: return +1
+    if z >= 2.2 and r > 70: return -1
     return 0
 
 def regime_ok(c):
@@ -381,10 +443,9 @@ def build_signal(score, sl, tp, price, strategy_name, regime, ml_txt,
 
 # ========================== MAIN ==========================
 def main():
-    log("=== RUN BOT XAUUSD v3.2 (STRICT) ===")
+    log("=== RUN BOT XAUUSD v3.3 ===")
     state = load_state()
 
-    # 1. Fetch
     try:
         c30 = fetch_ohlc("30m", "5d")
         c60 = fetch_ohlc("1h", "1mo")
@@ -397,23 +458,19 @@ def main():
     a     = atr(c30, 14)
     if a <= 0: log("ATR=0"); return
 
-    # 2. Regime volatilitas
     if not regime_ok(c30):
         log("Volatilitas ekstrem/sepi. Skip."); return
 
-    # 3. Killzone
     hh = datetime.now(timezone.utc).hour
     if not in_killzone(hh):
         log(f"Jam {hh} UTC di luar killzone. Skip."); return
     prime = hh in PRIME_HOURS
 
-    # 4. ADX regime
     adx_val = adx(c30, 14)
     if adx_val >= ADX_TREND:
         regime = f"TRENDING (ADX {adx_val:.1f})"
-        # MSB HANYA di prime hours
         if hh not in MSB_HOURS:
-            log(f"ADX trending tapi jam {hh} bukan prime. Skip MSB."); return
+            log(f"Trending tapi jam {hh} bukan prime. Skip."); return
         strategy = "MSB_Strict"
         score = strat_msb_strict(c30, c60) * 1.5
     elif adx_val <= ADX_RANGE:
@@ -424,18 +481,17 @@ def main():
         log(f"ADX {adx_val:.1f} zona transisi. Skip."); return
     log(f"{regime} | {strategy} | score={score:.2f}")
 
-    # 5. Spot
     spot_raw = fetch_spot()
     if spot_raw is not None:
         raw_spread = price - spot_raw
         prev_offset = float(state.get("spot_offset", raw_spread))
         samples = int(state.get("spot_samples", 0))
         if abs(raw_spread) > ABSOLUTE_MAX_SPREAD:
-            log(f"⚠️ Spread {raw_spread:.2f} > max. Skip."); save_state(state); return
+            log(f"Spread {raw_spread:.2f} > max. Skip."); save_state(state); return
         dev = abs(raw_spread - prev_offset)
         gate = samples >= BOOTSTRAP_SAMPLES
         if gate and dev > MAX_SUDDEN_SHIFT:
-            log(f"⚠️ Spot jump {dev:.2f}. Skip."); save_state(state); return
+            log(f"Spot jump {dev:.2f}. Skip."); save_state(state); return
         new_off = 0.85 * prev_offset + 0.15 * raw_spread
         state["spot_offset"] = round(new_off, 2)
         state["spot_samples"] = samples + 1
@@ -443,13 +499,11 @@ def main():
     else:
         spot_txt = "gagal verifikasi"
 
-    # 6. Equity curve filter
     consec = int(state.get("consec_losses", 0))
     if consec >= MAX_CONSEC_LOSS:
-        log(f"Equity filter: {consec} loss beruntun. Skip sampai reset.")
+        log(f"Equity filter: {consec} loss beruntun. Skip.")
         save_state(state); return
 
-    # 7. Cooldown
     now = datetime.now(timezone.utc)
     last_t = state.get("last_signal_time")
     if last_t and abs(score) > 0:
@@ -462,7 +516,6 @@ def main():
             log(f"Cooldown ({mins:.0f}/{COOLDOWN_MIN}m). Skip.")
             save_state(state); return
 
-    # 8. ML
     proba = ml_proba(c30)
     ml_txt = "n/a"
     if proba is not None:
@@ -470,7 +523,6 @@ def main():
         if proba < 0.55:
             log(f"ML tolak ({proba:.2f}). Skip."); save_state(state); return
 
-    # 9. Emit
     if abs(score) > 0:
         direction = 1 if score > 0 else -1
         sl = price - direction * SL_MULT * a
